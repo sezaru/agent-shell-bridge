@@ -212,15 +212,15 @@
     (should (seq-some (lambda (p) (string-match-p (url-hexify-string "❌") p)) puts))
     (should (seq-some (lambda (p) (string-match-p (url-hexify-string "⏳") p)) puts))))
 
-(ert-deftest asb-gw-command-gets-stop-mark ()
-  (let ((res (agent-shell-bridge-discord--mark-result
-              "c" "m" '(:status command :action interrupt)))
-        (puts nil))
-    (ignore res)
+(ert-deftest asb-gw-command-mark-differs-by-action ()
+  (let ((puts nil))
     (let ((agent-shell-bridge-discord--rest-fn
            (lambda (_m p _b) (push p puts) nil)))
-      (agent-shell-bridge-discord--mark-result "c" "m" '(:status command))
-      (should (string-match-p (url-hexify-string "🛑") (car puts))))))
+      (agent-shell-bridge-discord--mark-result "c" "m" '(:status command :action interrupt))
+      (agent-shell-bridge-discord--mark-result "c" "m" '(:status command :action command)))
+    (setq puts (reverse puts))
+    (should (string-match-p (url-hexify-string "🛑") (nth 0 puts)))   ; interrupt
+    (should (string-match-p (url-hexify-string "💬") (nth 1 puts))))) ; handled
 
 (ert-deftest asb-gw-set-status-running-swaps-reactions ()
   (let* ((calls nil)

@@ -29,6 +29,8 @@
 (require 'map)
 (require 'agent-shell-bridge-provider)
 
+(declare-function agent-shell--state "agent-shell")
+
 ;;;; Structured message model
 
 (cl-defun agent-shell-bridge-make-part (&key kind content meta)
@@ -54,6 +56,14 @@ SESSION is the provider session handle."
                  (if (stringp c) c "")))
              (plist-get message :parts)
              ""))
+
+(defun agent-shell-bridge-message-file (message)
+  "Return (FILENAME . DATA) for MESSAGE's first `file' part, or nil."
+  (seq-some (lambda (part)
+              (and (eq (plist-get part :kind) 'file)
+                   (cons (or (plist-get (plist-get part :meta) :filename) "attachment.txt")
+                         (or (plist-get part :content) ""))))
+            (plist-get message :parts)))
 
 ;;;; Normalizer: ACP session update -> structured message
 
@@ -357,39 +367,179 @@ control for that).  Submitted without stealing focus."
         (when (fboundp 'shell-maker-submit)
           (call-interactively #'shell-maker-submit)))))))
 
-(defcustom agent-shell-bridge-commands
-  '(("/interrupt" . interrupt)
-    ("/stop" . interrupt))
-  "Alist mapping an inbound command message to a control action."
-  :type '(alist :key-type string :value-type symbol)
-  :group 'agent-shell-bridge)
-
-(defun agent-shell-bridge--inbound-command (text)
-  "Return the control action if TEXT is a command message, else nil."
-  (and text (cdr (assoc (string-trim (downcase text))
-                        agent-shell-bridge-commands))))
-
 (defun agent-shell-bridge--buffer-busy-p (buffer)
   "Non-nil if BUFFER's agent is mid-turn."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (fboundp 'shell-maker-busy) (shell-maker-busy)))))
 
+;;; Slash commands (remote -> agent-shell control), some with arguments.
+
+(defun agent-shell-bridge--reply (text)
+  "Post TEXT back to the current session's surface as a system message.
+Runs the active provider's send, so it threads under this buffer's post."
+  (agent-shell-bridge--send
+   (agent-shell-bridge-make-message
+    :role 'system :status 'complete
+    :parts (list (agent-shell-bridge-make-part :kind 'text :content text)))))
+
+(defun agent-shell-bridge--reply-in (buffer text)
+  "Post TEXT to BUFFER's surface (safe from async callbacks)."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer (agent-shell-bridge--reply text))))
+
+(defun agent-shell-bridge--format-option-list (label options id-key name-key current)
+  "Render OPTIONS as a Discord/markdown list, flagging the CURRENT one."
+  (concat (format "**%s** — reply with `/%s <id>` to change:\n" label (downcase label))
+          (mapconcat
+           (lambda (o)
+             (let* ((id (format "%s" (alist-get id-key o)))
+                    (name (alist-get name-key o)))
+               (format "%s `%s`%s"
+                       (if (equal id (format "%s" current)) "▸" "•")
+                       id (if (and name (not (string-empty-p (format "%s" name))))
+                              (format " — %s" name) ""))))
+           options "\n")))
+
+(defun agent-shell-bridge--match-option (arg options id-key name-key)
+  "Find the option in OPTIONS whose id or name matches ARG (ci, substring)."
+  (let ((a (downcase (string-trim arg))))
+    (cl-flet ((s (k o) (downcase (format "%s" (or (alist-get k o) "")))))
+      (or (seq-find (lambda (o) (equal (s id-key o) a)) options)
+          (seq-find (lambda (o) (equal (s name-key o) a)) options)
+          (seq-find (lambda (o) (string-search a (s id-key o))) options)
+          (seq-find (lambda (o) (string-search a (s name-key o))) options)))))
+
+(cl-defun agent-shell-bridge--config-command
+    (&key buffer arg label get-fn id-key name-key current-fn set-fn set-key)
+  "List or set an agent-shell config option (model/mode/thought) via chat.
+Lists when ARG is empty; otherwise matches ARG to an option and calls
+SET-FN with (SET-KEY . id) plus success/failure replies."
+  (with-current-buffer buffer
+    (if (not (and (fboundp get-fn) (fboundp 'agent-shell--state)
+                  (derived-mode-p 'agent-shell-mode)))
+        (agent-shell-bridge--reply (format "%s control isn't available here." label))
+      (let* ((state (agent-shell--state))
+             (options (ignore-errors (funcall get-fn state)))
+             (current (and (fboundp current-fn)
+                           (ignore-errors (funcall current-fn state)))))
+        (cond
+         ((null options)
+          (agent-shell-bridge--reply (format "No %s options offered by this agent."
+                                             (downcase label))))
+         ((or (null arg) (string-empty-p (string-trim arg)))
+          (agent-shell-bridge--reply
+           (agent-shell-bridge--format-option-list label options id-key name-key current)))
+         (t
+          (let ((match (agent-shell-bridge--match-option arg options id-key name-key)))
+            (if (not match)
+                (agent-shell-bridge--reply
+                 (concat (format "No %s matches \"%s\".\n" (downcase label) (string-trim arg))
+                         (agent-shell-bridge--format-option-list
+                          label options id-key name-key current)))
+              (let ((id (format "%s" (alist-get id-key match))))
+                (if (not (fboundp set-fn))
+                    (agent-shell-bridge--reply (format "%s can't be set here." label))
+                  (funcall set-fn set-key id
+                           :on-success
+                           (lambda () (agent-shell-bridge--reply-in
+                                       buffer (format "✓ %s → `%s`" label id)))
+                           :on-failure
+                           (lambda (e &rest _) (agent-shell-bridge--reply-in
+                                                buffer (format "✗ %s failed: %s" label e))))))))))))))
+
+(defun agent-shell-bridge--cmd-model (arg buffer)
+  (agent-shell-bridge--config-command
+   :buffer buffer :arg arg :label "Model"
+   :get-fn 'agent-shell--get-available-models
+   :id-key :model-id :name-key :name
+   :current-fn 'agent-shell--current-model-id
+   :set-fn 'agent-shell--config-option-set-model-id :set-key :model-id))
+
+(defun agent-shell-bridge--cmd-thought (arg buffer)
+  (agent-shell-bridge--config-command
+   :buffer buffer :arg arg :label "Thought"
+   :get-fn 'agent-shell--get-available-thought-levels
+   :id-key :value :name-key :name
+   :current-fn 'agent-shell--current-thought-level-id
+   :set-fn 'agent-shell--config-option-set-thought-level-id :set-key :thought-level-id))
+
+(defun agent-shell-bridge--cmd-mode (arg buffer)
+  (agent-shell-bridge--config-command
+   :buffer buffer :arg arg :label "Mode"
+   :get-fn 'agent-shell--get-available-modes
+   :id-key :id :name-key :name
+   :current-fn 'agent-shell--current-mode-id
+   :set-fn 'agent-shell--config-option-set-mode-id :set-key :mode-id))
+
+(defun agent-shell-bridge--cmd-transcript (_arg buffer)
+  "Attach the full session transcript (the shell buffer text)."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((data (buffer-substring-no-properties (point-min) (point-max))))
+        (agent-shell-bridge--send
+         (agent-shell-bridge-make-message
+          :role 'system :status 'complete
+          :parts (list (agent-shell-bridge-make-part
+                        :kind 'file :content data
+                        :meta (list :filename "transcript.md")))))))))
+
+(defun agent-shell-bridge--cmd-interrupt (_arg buffer)
+  (with-current-buffer buffer
+    (when (fboundp 'agent-shell-interrupt)
+      (ignore-errors (agent-shell-interrupt t)))))
+
+(defun agent-shell-bridge--cmd-help (_arg buffer)
+  (with-current-buffer buffer
+    (agent-shell-bridge--reply
+     (concat "**Commands**\n"
+             "• `/model` `/thought` `/mode` — list; add an id/name to change\n"
+             "• `/transcript` — attach the full conversation\n"
+             "• `/interrupt` — stop the current turn\n"
+             "Anything else is sent to the agent as a prompt."))))
+
+(defcustom agent-shell-bridge-command-table
+  '(("/model" . agent-shell-bridge--cmd-model)
+    ("/thought" . agent-shell-bridge--cmd-thought)
+    ("/mode" . agent-shell-bridge--cmd-mode)
+    ("/transcript" . agent-shell-bridge--cmd-transcript)
+    ("/interrupt" . agent-shell-bridge--cmd-interrupt)
+    ("/stop" . agent-shell-bridge--cmd-interrupt)
+    ("/help" . agent-shell-bridge--cmd-help))
+  "Alist of inbound slash-command name -> handler (ARG BUFFER)."
+  :type '(alist :key-type string :value-type function)
+  :group 'agent-shell-bridge)
+
+(defun agent-shell-bridge--parse-command (text)
+  "Return (NAME . ARG) when TEXT is a known slash command, else nil.
+NAME is downcased; ARG is the trimmed remainder (nil when none)."
+  (when (and text (string-prefix-p "/" (string-trim-left text)))
+    (let* ((s (string-trim text))
+           (sp (string-match "[ \t\n]" s))
+           (name (downcase (if sp (substring s 0 sp) s)))
+           (arg (and sp (string-trim (substring s sp)))))
+      (when (assoc name agent-shell-bridge-command-table)
+        (cons name arg)))))
+
 (defun agent-shell-bridge--dispatch-inbound (event)
   "Handle an inbound EVENT (:text :session); return a result plist.
-Result `:status' is `command', `consumed' or `refused' (with a `:reason'
-of `busy' or `no-session').  A busy agent refuses -- it never queues."
+Result `:status' is `command', `consumed', `refused' (`:reason' `busy')
+or `ignore'.  A slash command runs its handler; other text injects when
+idle and refuses when busy (it never queues)."
   (let* ((text (plist-get event :text))
          (session (plist-get event :session))
          (buffer (agent-shell-bridge--buffer-for-session session))
-         (cmd (agent-shell-bridge--inbound-command text)))
+         (cmd (agent-shell-bridge--parse-command text)))
     (cond
      ;; Not one of this instance's posts -> ignore silently (no reaction).
      ((not (buffer-live-p buffer))
       (list :status 'ignore))
      (cmd
-      (agent-shell-bridge-handle-control (list :action cmd :session session))
-      (list :status 'command :action cmd))
+      (ignore-errors
+        (funcall (cdr (assoc (car cmd) agent-shell-bridge-command-table))
+                 (cdr cmd) buffer))
+      (list :status 'command
+            :action (if (member (car cmd) '("/interrupt" "/stop")) 'interrupt 'command)))
      ((agent-shell-bridge--buffer-busy-p buffer)
       (list :status 'refused :reason 'busy))
      (t

@@ -164,6 +164,47 @@
         :parts (list (agent-shell-bridge-make-part :kind 'text :content "hmm"))))
       (should (equal posts '("-# Thinking"))))))
 
+(ert-deftest asb-discord-send-file-part-uploads ()
+  ;; A message carrying a file part (e.g. /transcript) uploads as an attachment.
+  (let* ((captured nil)
+         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--upload-fn
+          (lambda (url name data) (setq captured (list url name data)))))
+    (agent-shell-bridge-discord--send
+     (agent-shell-bridge-make-message
+      :role 'system :status 'complete
+      :parts (list (agent-shell-bridge-make-part
+                    :kind 'file :content "transcript body"
+                    :meta (list :filename "transcript.md")))))
+    (should (equal (nth 1 captured) "transcript.md"))
+    (should (equal (nth 2 captured) "transcript body"))))
+
+(ert-deftest asb-discord-permission-adds-tappable-reactions ()
+  (with-temp-buffer
+    (let* ((reacts nil)
+           (agent-shell-bridge-discord-webhook-url "https://hook")
+           (agent-shell-bridge-discord--post-fn (lambda (_u _c) "perm-1"))
+           (agent-shell-bridge-discord--react-fn
+            (lambda (_t id emoji) (push (cons id emoji) reacts))))
+      (setq-local agent-shell-bridge--session-handle "thread-1")
+      (should (equal (agent-shell-bridge-discord--send
+                      (agent-shell-bridge-make-message
+                       :role 'permission :status 'pending
+                       :parts (list (agent-shell-bridge-make-part
+                                     :kind 'text :content "rm -rf /"))))
+                     "perm-1"))
+      (should (equal (reverse reacts) '(("perm-1" . "✅") ("perm-1" . "❌")))))))
+
+(ert-deftest asb-discord-permission-flatten-has-tap-hint ()
+  (let ((out (agent-shell-bridge-discord--flatten
+              (agent-shell-bridge-make-message
+               :role 'permission :status 'pending
+               :parts (list (agent-shell-bridge-make-part
+                             :kind 'text :content "rm -rf /"))))))
+    (should (string-match-p "Permission Required" out))
+    (should (string-match-p "rm -rf /" out))
+    (should (string-match-p "✅ to allow" out))))
+
 (ert-deftest asb-discord-edit-url-threads-and-targets-message ()
   (let ((agent-shell-bridge-discord-webhook-url "https://hook"))
     (should (equal (agent-shell-bridge-discord--edit-url "m-1")

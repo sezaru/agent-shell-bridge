@@ -283,6 +283,7 @@ These are the backlog typed while Emacs was offline -- to be rejected."
    (append messages nil)))
 
 (defconst agent-shell-bridge-discord--command-mark "🛑")
+(defconst agent-shell-bridge-discord--handled-mark "💬")
 
 (defconst agent-shell-bridge-discord--reason-emoji
   '((busy . "⏳") (offline . "💤") (no-session . "❓"))
@@ -301,7 +302,10 @@ These are the backlog typed while Emacs was offline -- to be rejected."
     ('ignore nil)                       ; not our post: leave no trace
     ('consumed (agent-shell-bridge-discord--mark channel-id message-id t))
     ('command (agent-shell-bridge-discord--react
-               channel-id message-id agent-shell-bridge-discord--command-mark))
+               channel-id message-id
+               (if (eq (plist-get result :action) 'interrupt)
+                   agent-shell-bridge-discord--command-mark
+                 agent-shell-bridge-discord--handled-mark)))
     ('refused
      (agent-shell-bridge-discord--mark channel-id message-id nil)
      (when-let* ((e (alist-get (plist-get result :reason)
@@ -511,6 +515,10 @@ instance's or session's posts."
   (interactive)
   (agent-shell-bridge-register-provider (agent-shell-bridge-discord-provider))
   (agent-shell-bridge-set-provider 'discord)
+  ;; Let the webhook side add tappable ✅/❌ to permission messages via the bot.
+  (setq agent-shell-bridge-discord--react-fn
+        (lambda (thread-id message-id emoji)
+          (agent-shell-bridge-discord--react thread-id message-id emoji)))
   (when (and agent-shell-bridge-discord-bot-token (featurep 'websocket))
     (ignore-errors (agent-shell-bridge-discord-gateway-connect))))
 

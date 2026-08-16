@@ -82,6 +82,10 @@ here, and return nil."
       ((or 'thinking 'tool) nil)
       ('activity
        (unless (string-empty-p text) (concat "-# " text)))
+      ('permission
+       (concat (agent-shell-bridge-discord--header message) "\n"
+               (if (string-empty-p text) "The agent requests permission." text)
+               "\n-# React ✅ to allow · ❌ to deny"))
       (_
        (let* ((header (agent-shell-bridge-discord--header message))
               (marker agent-shell-bridge-discord--truncation-marker)
@@ -272,6 +276,27 @@ Keeps Emacs responsive -- the mirrored message id is not needed."
   #'agent-shell-bridge-discord--curl-edit-async
   "Function of (URL CONTENT) that PATCHes a webhook message.  Rebound in tests.")
 
+(defun agent-shell-bridge-discord--curl-upload-async (url name data)
+  "Fire-and-forget multipart POST attaching DATA as file NAME to URL."
+  (let ((tmp (make-temp-file "asb-discord-" nil ".txt" data)))
+    (condition-case _
+        (make-process
+         :name "asb-discord-upload" :noquery t :buffer nil
+         :sentinel (lambda (_p _e) (ignore-errors (delete-file tmp)))
+         :command (list "curl" "-s" "-X" "POST"
+                        "-F" (format "files[0]=@%s;filename=%s;type=text/plain" tmp name)
+                        url))
+      (error (ignore-errors (delete-file tmp)))))
+  nil)
+
+(defvar agent-shell-bridge-discord--upload-fn
+  #'agent-shell-bridge-discord--curl-upload-async
+  "Function of (URL NAME DATA) uploading a file attachment.  Rebound in tests.")
+
+(defvar agent-shell-bridge-discord--react-fn nil
+  "Function of (THREAD-ID MESSAGE-ID EMOJI) reacting via the bot, or nil.
+Set by the gateway so permission messages get tappable ✅/❌ affordances.")
+
 (defun agent-shell-bridge-discord--with-wait (url)
   "Append the wait=true query param to URL so the POST returns the message."
   (concat url (if (string-search "?" url) "&" "?") "wait=true"))
@@ -296,23 +321,37 @@ Keeps Emacs responsive -- the mirrored message id is not needed."
     (concat agent-shell-bridge-discord-webhook-url "/messages/" id
             (if thread (format "?thread_id=%s" thread) ""))))
 
+(defun agent-shell-bridge-discord--post-permission (url content)
+  "Post a permission CONTENT to URL synchronously, then add tappable ✅/❌.
+Returns the message id so the reaction can be correlated to the request."
+  (let ((id (funcall agent-shell-bridge-discord--post-fn url content)))
+    (when (and id agent-shell-bridge-discord--react-fn)
+      (let ((thread (agent-shell-bridge-discord--session-thread)))
+        (funcall agent-shell-bridge-discord--react-fn thread id "✅")
+        (funcall agent-shell-bridge-discord--react-fn thread id "❌")))
+    id))
+
 (defun agent-shell-bridge-discord--send (message)
   "Handle MESSAGE for the webhook.
-Thinking and tool messages fold into this turn's activity summary (posted
-once, then edited in place); the agent's reply and the user's prompt post
-as normal messages; a permission posts synchronously so its id can
-correlate the ✅/❌ reaction.  Threads under the session's forum post."
+Thinking and tool messages fold into this turn's activity summary; a
+message with a file part uploads as an attachment (e.g. /transcript); a
+permission posts synchronously and gets tappable ✅/❌ reactions; the
+agent reply, user prompt and command replies post as normal messages.
+Threads under the session's forum post."
   (unless agent-shell-bridge-discord-webhook-url
     (error "agent-shell-bridge-discord-webhook-url is not set"))
   (pcase (plist-get message :role)
     ('thinking (agent-shell-bridge-discord--act-note-thinking) nil)
     ('tool (agent-shell-bridge-discord--act-note-tool message) nil)
     (_
-     (when-let* ((content (agent-shell-bridge-discord--render message)))
-       (let ((url (agent-shell-bridge-discord--target-url)))
-         (if (eq (plist-get message :role) 'permission)
-             (funcall agent-shell-bridge-discord--post-fn url content)
-           (funcall agent-shell-bridge-discord--post-async-fn url content)))))))
+     (if-let* ((file (agent-shell-bridge-message-file message)))
+         (funcall agent-shell-bridge-discord--upload-fn
+                  (agent-shell-bridge-discord--target-url) (car file) (cdr file))
+       (when-let* ((content (agent-shell-bridge-discord--render message)))
+         (let ((url (agent-shell-bridge-discord--target-url)))
+           (if (eq (plist-get message :role) 'permission)
+               (agent-shell-bridge-discord--post-permission url content)
+             (funcall agent-shell-bridge-discord--post-async-fn url content))))))))
 
 ;;; Forum: one post per session
 
