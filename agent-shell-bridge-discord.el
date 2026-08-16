@@ -151,13 +151,25 @@ response we do not need back."
 ;; can consume every thinking chunk and tool call instead of discarding
 ;; them.
 
+(defconst agent-shell-bridge-discord--role-color
+  '((agent . "36") (user . "33") (permission . "31"))
+  "ANSI SGR color code per role (cyan / yellow / red).
+Discord renders coloured text only inside an ```ansi code block, so the
+role label is wrapped in one; roles absent here fall back to plain bold.")
+
 (defun agent-shell-bridge-discord--header (message)
-  "Role header line for MESSAGE (agent/user/permission/system only)."
-  (pcase (plist-get message :role)
-    ('agent "🤖 **Agent**")
-    ('user "🧑 **User**")
-    ('permission "⚠️ **Permission Required**")
-    (_ "ℹ️ **System**")))
+  "Coloured role header for MESSAGE (agent/user/permission/system only)."
+  (let* ((role (plist-get message :role))
+         (label (pcase role
+                  ('agent "🤖 Agent")
+                  ('user "🧑 User")
+                  ('permission "⚠️ Permission Required")
+                  (_ "ℹ️ System")))
+         (color (alist-get role agent-shell-bridge-discord--role-color)))
+    (if color
+        ;; An ```ansi fence is the only way to colour text in Discord.
+        (format "```ansi\n\e[1;%sm%s\e[0m\n```" color label)
+      (format "**%s**" label))))
 
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
   "Flatten a foreground MESSAGE (agent/user/permission/system) to a string.
@@ -258,7 +270,10 @@ here, and return nil."
   (let ((summary (agent-shell-bridge-discord--act-summary)))
     (when (and summary (not (equal summary agent-shell-bridge-discord--act-rendered)))
       (setq agent-shell-bridge-discord--act-rendered summary)
-      (let ((content (agent-shell-bridge-discord--separated (concat "-# " summary)))
+      ;; Discord subtext (`-#') swallows one trailing newline, so the plain
+      ;; separator leaves no blank line after the Thought line -- add an
+      ;; extra newline to compensate.
+      (let ((content (agent-shell-bridge-discord--separated (concat "-# " summary "\n")))
             (thread (agent-shell-bridge-discord--post-channel)))
         (if agent-shell-bridge-discord--act-id
             (funcall agent-shell-bridge-discord--edit-fn
