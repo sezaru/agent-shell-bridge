@@ -232,7 +232,7 @@
     (should (equal (nth 0 (nth 0 calls)) "DELETE"))
     (should (string-match-p (url-hexify-string "💤") (nth 1 (nth 0 calls))))
     (should (equal (nth 0 (nth 1 calls)) "PUT"))
-    (should (string-match-p (url-hexify-string "🟢") (nth 1 (nth 1 calls))))
+    (should (string-match-p (url-hexify-string "⚙️") (nth 1 (nth 1 calls))))
     (should (string-match-p "/messages/thread-1/" (nth 1 (nth 1 calls))))))
 
 (ert-deftest asb-gw-forum-threads-filters-by-parent ()

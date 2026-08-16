@@ -39,6 +39,34 @@
          (out (agent-shell-bridge-discord--flatten m)))
     (should (equal out "🤖 **Agent**\nhello world"))))
 
+(ert-deftest asb-discord-flatten-tool-output-collapsed-in-spoiler ()
+  (let ((out (agent-shell-bridge-discord--flatten
+              (agent-shell-bridge-make-message
+               :role 'tool :status 'success
+               :parts (list (agent-shell-bridge-make-part
+                             :kind 'tool-call :content "line1\nline2"))))))
+    (should (string-prefix-p "✅" out))
+    (should (string-match-p "||```" out))       ; output collapsed + fenced
+    (should (string-match-p "line1" out))))
+
+(ert-deftest asb-discord-flatten-tool-pending-compact-command ()
+  (let ((out (agent-shell-bridge-discord--flatten
+              (agent-shell-bridge-make-message
+               :role 'tool :status 'pending
+               :parts (list (agent-shell-bridge-make-part
+                             :kind 'tool-call :content "rg -n foo\n  bar"))))))
+    (should (string-match-p "`rg -n foo bar`" out))   ; one-lined, not fenced
+    (should-not (string-match-p "||" out))))
+
+(ert-deftest asb-discord-flatten-agent-not-collapsed ()
+  (let ((out (agent-shell-bridge-discord--flatten
+              (agent-shell-bridge-make-message
+               :role 'agent :status 'complete
+               :parts (list (agent-shell-bridge-make-part
+                             :kind 'text :content "the answer"))))))
+    (should-not (string-match-p "||" out))
+    (should (string-match-p "the answer" out))))
+
 (ert-deftest asb-discord-flatten-tool-status-emoji ()
   (let ((err (agent-shell-bridge-discord--flatten
               (agent-shell-bridge-make-message

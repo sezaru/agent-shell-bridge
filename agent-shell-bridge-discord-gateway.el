@@ -300,7 +300,7 @@ These are the backlog typed while Emacs was offline -- to be rejected."
 
 ;;;; Per-session running indicator (🟢 running / 💤 idle on the post)
 
-(defconst agent-shell-bridge-discord--status-running "🟢")
+(defconst agent-shell-bridge-discord--status-running "⚙️")
 (defconst agent-shell-bridge-discord--status-idle "💤")
 
 (defun agent-shell-bridge-discord--set-status (thread-id running)

@@ -47,10 +47,15 @@ webhook."
 (defconst agent-shell-bridge-discord--truncation-marker "\n… **[truncated]**"
   "Appended when a flattened message overflows the cap.")
 
-(defconst agent-shell-bridge-discord--reserve 8
-  "Safety margin (chars) kept free for fence balancing / multibyte drift.")
+(defconst agent-shell-bridge-discord--body-overhead 40
+  "Chars reserved for header, spoiler/code wrappers, marker and newlines.")
 
 ;;;; Flattening
+
+;; Rendering mirrors agent-shell's collapsed layout so the channel stays
+;; scannable: the agent's actual message and a compact tool header are shown
+;; plainly, while thinking and tool output are collapsed behind spoilers
+;; (Discord's closest analogue) -- click to expand.
 
 (defun agent-shell-bridge-discord--status-emoji (status)
   (pcase status
@@ -65,58 +70,55 @@ webhook."
   (pcase (plist-get message :role)
     ('agent "🤖 **Agent**")
     ('user "🧑 **User**")
-    ('thinking "💭 **Thinking**")
+    ('thinking "💭 **Thinking** *(expand)*")
     ('permission "⚠️ **Permission Required**")
     ('tool (format "%s **Tool**"
                    (agent-shell-bridge-discord--status-emoji
                     (plist-get message :status))))
     (_ "ℹ️ **System**")))
 
-(defun agent-shell-bridge-discord--render-part (part)
-  "Render a message PART to Discord markdown."
-  (let ((content (or (plist-get part :content) "")))
-    (pcase (plist-get part :kind)
-      ('diff (format "```diff\n%s\n```" content))
-      ((or 'code 'tool-call) (if (string-empty-p content)
-                                 ""
-                               (format "```\n%s\n```" content)))
-      (_ content))))
+(defun agent-shell-bridge-discord--spoiler (s)
+  "Wrap S in a Discord spoiler (collapsed, click to reveal)."
+  (concat "||" s "||"))
 
-(defun agent-shell-bridge-discord--body (message)
-  "Concatenate rendered non-empty parts of MESSAGE."
-  (mapconcat #'identity
-             (seq-remove #'string-empty-p
-                         (mapcar #'agent-shell-bridge-discord--render-part
-                                 (plist-get message :parts)))
-             "\n"))
+(defun agent-shell-bridge-discord--one-line (s)
+  "Collapse whitespace in S to a compact single line."
+  (string-trim (replace-regexp-in-string "[ \t\n]+" " " s)))
 
-(defun agent-shell-bridge-discord--balance-fences (s)
-  "Append a closing code fence to S if it has an odd number of them."
-  (let ((n 0) (start 0))
-    (while (string-match "```" s start)
-      (setq n (1+ n) start (match-end 0)))
-    (if (cl-oddp n) (concat s "\n```") s)))
+(defun agent-shell-bridge-discord--render-body (message text)
+  "Render TEXT of MESSAGE with per-role collapse rules."
+  (let ((role (plist-get message :role))
+        (status (plist-get message :status)))
+    (cond
+     ((string-empty-p (string-trim text)) "")
+     ;; Thinking: collapse everything behind a spoiler.
+     ((or (eq role 'thinking) (plist-get message :collapsible))
+      (agent-shell-bridge-discord--spoiler text))
+     ;; Tool: a starting call shows the command compactly; a finished call
+     ;; collapses its (often large) output behind a spoiler.
+     ((eq role 'tool)
+      (if (eq status 'pending)
+          (format "`%s`" (agent-shell-bridge-discord--one-line text))
+        (agent-shell-bridge-discord--spoiler
+         (format "```\n%s\n```" text))))
+     ;; Agent / user / permission: the point of the message -- shown plainly.
+     (t text))))
 
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
   "Flatten MESSAGE to a single Discord message string of at most MAX-LEN chars.
-Thinking / collapsible content is wrapped in a spoiler; overflow is hard
-truncated with a marker."
+Thinking and tool output collapse behind spoilers; overflow is hard
+truncated with a marker before wrapping (so fences/spoilers stay balanced)."
   (let* ((max-len (or max-len agent-shell-bridge-discord-max-length))
          (header (agent-shell-bridge-discord--header message))
-         (collapsible (or (plist-get message :collapsible)
-                          (eq (plist-get message :role) 'thinking)))
-         (body (agent-shell-bridge-discord--body message))
          (marker agent-shell-bridge-discord--truncation-marker)
-         (wrap (if collapsible 4 0))       ; leading + trailing "||"
-         (budget (- max-len (length header) 1 wrap
-                    agent-shell-bridge-discord--reserve)))
-    (when (> (length body) budget)
-      (setq body (agent-shell-bridge-discord--balance-fences
-                  (concat (substring body 0 (max 0 (- budget (length marker))))
-                          marker))))
-    (when collapsible
-      (setq body (concat "||" body "||")))
-    (concat header "\n" body)))
+         (budget (- max-len (length header)
+                    agent-shell-bridge-discord--body-overhead))
+         (text (agent-shell-bridge-message-text message)))
+    (when (> (length text) budget)
+      (setq text (concat (substring text 0 (max 0 (- budget (length marker))))
+                         marker)))
+    (concat header "\n"
+            (agent-shell-bridge-discord--render-body message text))))
 
 ;;;; Transport
 
