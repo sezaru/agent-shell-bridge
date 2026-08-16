@@ -278,9 +278,10 @@ single complete message on flush."
               (buffer-list)))
 
 (defun agent-shell-bridge--buffer-for-session (session)
-  "Resolve SESSION handle to a buffer, falling back to the sole bridged one."
-  (or (gethash session agent-shell-bridge--session->buffer)
-      (car (agent-shell-bridge--active-buffers))))
+  "Resolve SESSION (a post/thread id) to the buffer that owns it, or nil.
+Strict: a session this instance does not own returns nil so its messages
+are ignored, keeping concurrent sessions/instances isolated."
+  (gethash session agent-shell-bridge--session->buffer))
 
 (defun agent-shell-bridge-inject (text &optional buffer)
   "Inject TEXT as a prompt into BUFFER (an `agent-shell' buffer).
@@ -330,11 +331,12 @@ of `busy' or `no-session').  A busy agent refuses -- it never queues."
          (buffer (agent-shell-bridge--buffer-for-session session))
          (cmd (agent-shell-bridge--inbound-command text)))
     (cond
+     ;; Not one of this instance's posts -> ignore silently (no reaction).
+     ((not (buffer-live-p buffer))
+      (list :status 'ignore))
      (cmd
       (agent-shell-bridge-handle-control (list :action cmd :session session))
       (list :status 'command :action cmd))
-     ((not (buffer-live-p buffer))
-      (list :status 'refused :reason 'no-session))
      ((agent-shell-bridge--buffer-busy-p buffer)
       (list :status 'refused :reason 'busy))
      (t
@@ -387,10 +389,12 @@ actions (expand/collapse/full/hide) are provider-side concerns."
       ((or 'approve 'deny)
        (agent-shell-bridge--resolve-permission target action))
       ('interrupt
-       (dolist (b (agent-shell-bridge--active-buffers))
-         (with-current-buffer b
-           (when (fboundp 'agent-shell-interrupt)
-             (ignore-errors (agent-shell-interrupt t)))))))))
+       (when-let* ((buf (agent-shell-bridge--buffer-for-session
+                         (plist-get event :session))))
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (when (fboundp 'agent-shell-interrupt)
+               (ignore-errors (agent-shell-interrupt t))))))))))
 
 ;;;; Capture layer (advice around agent-shell internals)
 

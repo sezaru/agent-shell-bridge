@@ -289,6 +289,7 @@ These are the backlog typed while Emacs was offline -- to be rejected."
 (defun agent-shell-bridge-discord--mark-result (channel-id message-id result)
   "React to MESSAGE-ID per the dispatch RESULT plist."
   (pcase (plist-get result :status)
+    ('ignore nil)                       ; not our post: leave no trace
     ('consumed (agent-shell-bridge-discord--mark channel-id message-id t))
     ('command (agent-shell-bridge-discord--react
                channel-id message-id agent-shell-bridge-discord--command-mark))
@@ -323,21 +324,13 @@ consumed and must not be injected into a conversation that moved on."
       (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
     stale))
 
-(defun agent-shell-bridge-discord--forum-threads ()
-  "Return active thread ids of posts under the configured forum channel."
-  (let ((resp (agent-shell-bridge-discord--rest
-               "GET" (format "/guilds/%s/threads/active"
-                             agent-shell-bridge-discord-guild-id))))
-    (seq-map (lambda (th) (alist-get 'id th))
-             (seq-filter
-              (lambda (th) (equal (alist-get 'parent_id th)
-                                  agent-shell-bridge-discord-channel-id))
-              (append (alist-get 'threads resp) nil)))))
-
 (defun agent-shell-bridge-discord--sweep-forum ()
-  "Reject unprocessed (offline-backlog) user messages across all forum posts."
-  (dolist (thread (agent-shell-bridge-discord--forum-threads))
-    (ignore-errors (agent-shell-bridge-discord--reject-stale thread))))
+  "Reject unprocessed backlog in this instance's OWN posts only.
+Restricted to owned threads so a shared bot never touches another
+instance's or session's posts."
+  (dolist (thread (hash-table-keys agent-shell-bridge--session->buffer))
+    (when (stringp thread)
+      (ignore-errors (agent-shell-bridge-discord--reject-stale thread)))))
 
 ;;;; Live connection (guarded; not unit tested)
 

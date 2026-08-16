@@ -61,11 +61,11 @@
 (ert-deftest asb-handle-control-interrupt-calls-agent-shell ()
   (let ((interrupted 0))
     (with-temp-buffer
-      (setq-local agent-shell-bridge-mode t)
-      ;; make derived-mode-p-independent: interrupt iterates bridged buffers
+      (puthash "s" (current-buffer) agent-shell-bridge--session->buffer)
       (cl-letf (((symbol-function 'agent-shell-interrupt)
                  (lambda (&rest _) (cl-incf interrupted))))
-        (agent-shell-bridge-handle-control (list :action 'interrupt))))
+        (agent-shell-bridge-handle-control (list :action 'interrupt :session "s")))
+      (remhash "s" agent-shell-bridge--session->buffer))
     (should (= interrupted 1))))
 
 (ert-deftest asb-dispatch-inbound-injects-into-session-buffer ()
@@ -91,16 +91,27 @@
 (ert-deftest asb-dispatch-inbound-command-interrupts-not-injects ()
   (let ((interrupted 0) (injected nil))
     (with-temp-buffer
-      (setq-local agent-shell-bridge-mode t)
+      (puthash "s" (current-buffer) agent-shell-bridge--session->buffer)
       (cl-letf (((symbol-function 'agent-shell-interrupt)
                  (lambda (&rest _) (cl-incf interrupted)))
                 ((symbol-function 'agent-shell-bridge-inject)
                  (lambda (&rest _) (setq injected t))))
         (let ((res (agent-shell-bridge--dispatch-inbound
-                    (list :text "/interrupt" :session nil))))
+                    (list :text "/interrupt" :session "s"))))
           (should (eq (plist-get res :status) 'command))
           (should (= interrupted 1))
-          (should (null injected)))))))
+          (should (null injected))))
+      (remhash "s" agent-shell-bridge--session->buffer))))
+
+(ert-deftest asb-dispatch-inbound-ignores-unowned-post ()
+  (let ((injected nil))
+    (cl-letf (((symbol-function 'agent-shell-bridge-inject)
+               (lambda (&rest _) (setq injected t))))
+      ;; session "nope" is not in the ownership map
+      (let ((res (agent-shell-bridge--dispatch-inbound
+                  (list :text "hi" :session "nope"))))
+        (should (eq (plist-get res :status) 'ignore))
+        (should (null injected))))))
 
 (ert-deftest asb-dispatch-inbound-refuses-when-busy ()
   (let ((injected nil))

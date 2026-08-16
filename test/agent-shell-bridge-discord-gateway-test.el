@@ -235,16 +235,6 @@
     (should (string-match-p (url-hexify-string "⚙️") (nth 1 (nth 1 calls))))
     (should (string-match-p "/messages/thread-1/" (nth 1 (nth 1 calls))))))
 
-(ert-deftest asb-gw-forum-threads-filters-by-parent ()
-  (let* ((agent-shell-bridge-discord-guild-id "g1")
-         (agent-shell-bridge-discord-channel-id "forum")
-         (agent-shell-bridge-discord--rest-fn
-          (lambda (_m _p _b)
-            '((threads . [((id . "t1") (parent_id . "forum"))
-                          ((id . "t2") (parent_id . "other"))
-                          ((id . "t3") (parent_id . "forum"))])))))
-    (should (equal (agent-shell-bridge-discord--forum-threads) '("t1" "t3")))))
-
 (ert-deftest asb-gw-reaction-ignores-bot-own ()
   (let* ((fired nil)
          (gw (agent-shell-bridge-discord-gateway-create
