@@ -56,15 +56,24 @@ webhook."
 (defconst agent-shell-bridge-discord--body-overhead 40
   "Chars reserved for header, spoiler/code wrappers, marker and newlines.")
 
-;;;; Flattening
+;;;; Rendering
 
 ;; Rendering mirrors agent-shell's collapsed layout so the channel stays
 ;; scannable instead of a wall of grey.  The agent's reply and the user's
-;; prompt are shown plainly; a tool call is a single command line; its
-;; output is NOT dumped (it lives in Emacs, exactly like agent-shell's
-;; collapsed transcript) -- only a failure is echoed, tersely.  Thinking is
-;; one small inline spoiler.  A message that carries no signal (a finished
-;; or in-progress tool update) flattens to nil and is not posted at all.
+;; prompt are shown plainly; a tool call is a single command line.  Its
+;; output is kept -- short output inline in a plain code block, larger
+;; output as a *file attachment* (Discord's one true collapse: a compact
+;; card you click to expand), rather than a giant spoiler box.  Thinking is
+;; one small inline spoiler.  Anything with no signal (an in-progress tool
+;; update, an empty finished one) renders to nil and is not posted.
+;;
+;; `--render' is the entry point: it returns either a content string, an
+;; attachment plist `(:file NAME :data DATA :caption CAP)', or nil.
+;; `--flatten' handles only the string (text) roles and is what the gateway
+;; REST path uses directly.
+
+(defconst agent-shell-bridge-discord--inline-output-max 500
+  "Tool output at or under this many chars/8 lines is shown inline.")
 
 (defun agent-shell-bridge-discord--header (message)
   "Role header line for MESSAGE (agent/user/permission/system only)."
@@ -88,15 +97,40 @@ webhook."
       (concat (substring s 0 (max 0 limit)) "…")
     s))
 
+(defun agent-shell-bridge-discord--short-output-p (text)
+  "Non-nil if TEXT is small enough to show inline rather than attach."
+  (and (<= (length text) agent-shell-bridge-discord--inline-output-max)
+       (<= (cl-count ?\n text) 8)))
+
+(defun agent-shell-bridge-discord--tool-render (message)
+  "Render a tool MESSAGE: a string, an attachment plist, or nil.
+Pending shows the command; a finished call shows its output inline (small)
+or as a file attachment (large); in-progress updates are dropped."
+  (let ((status (plist-get message :status))
+        (text (string-trim (agent-shell-bridge-message-text message))))
+    (pcase status
+      ('pending
+       (unless (string-empty-p text)
+         (format "🔧 `%s`" (agent-shell-bridge-discord--one-line text))))
+      ((or 'success 'error 'failed)
+       (let ((mark (if (memq status '(error failed)) "❌" "✅")))
+         (cond
+          ((string-empty-p text)
+           (and (equal mark "❌") "❌ `(failed)`"))
+          ((agent-shell-bridge-discord--short-output-p text)
+           (format "%s\n```\n%s\n```" mark text))
+          (t (list :file (if (equal mark "❌") "error.txt" "output.txt")
+                   :data text :caption mark)))))
+      ;; in-progress tool update: nothing to show yet.
+      (_ nil))))
+
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
-  "Flatten MESSAGE to a Discord string, or nil to suppress it.
-Thinking collapses to a compact inline spoiler; a tool call is a single
-command line and its successful output is suppressed (seen in Emacs) --
-only a failure is echoed.  Agent/user/permission text is shown plainly,
-truncated to at most MAX-LEN chars."
+  "Flatten a text-role MESSAGE to a Discord string, or nil.
+Handles agent/user/permission/system (plain, truncated to MAX-LEN) and
+thinking (a compact inline spoiler).  Tool messages are handled by
+`--render'/`--tool-render' instead."
   (let* ((max-len (or max-len agent-shell-bridge-discord-max-length))
          (role (plist-get message :role))
-         (status (plist-get message :status))
          (text (string-trim (agent-shell-bridge-message-text message))))
     (pcase role
       ('thinking
@@ -105,17 +139,7 @@ truncated to at most MAX-LEN chars."
                  (agent-shell-bridge-discord--spoiler
                   (agent-shell-bridge-discord--truncate
                    text agent-shell-bridge-discord-thinking-limit)))))
-      ('tool
-       (pcase status
-         ('pending
-          (unless (string-empty-p text)
-            (format "🔧 `%s`" (agent-shell-bridge-discord--one-line text))))
-         ((or 'error 'failed)
-          (format "❌ `%s`"
-                  (agent-shell-bridge-discord--one-line
-                   (agent-shell-bridge-discord--truncate text 300))))
-         ;; success / in-progress: output lives in Emacs, don't post it.
-         (_ nil)))
+      ('tool (agent-shell-bridge-discord--tool-render message))
       (_
        (let* ((header (agent-shell-bridge-discord--header message))
               (marker agent-shell-bridge-discord--truncation-marker)
@@ -126,6 +150,10 @@ truncated to at most MAX-LEN chars."
            (setq body (concat (substring body 0 (max 0 (- budget (length marker))))
                               marker)))
          (concat header "\n" body))))))
+
+(defalias 'agent-shell-bridge-discord--render #'agent-shell-bridge-discord--flatten
+  "Return the Discord payload for a message: a string, an attachment plist
+`(:file NAME :data DATA :caption CAP)', or nil to suppress.")
 
 ;;;; Transport
 
@@ -163,6 +191,27 @@ Keeps Emacs responsive -- the mirrored message id is not needed."
   #'agent-shell-bridge-discord--curl-post-async
   "Function of (URL CONTENT) that POSTs without waiting.  Rebound in tests.")
 
+(defun agent-shell-bridge-discord--curl-upload-async (url caption name data)
+  "Fire-and-forget multipart POST attaching DATA as file NAME to URL.
+CAPTION is the message content shown beside the file card.  Returns nil."
+  (let ((tmp (make-temp-file "asb-discord-" nil ".txt" data)))
+    (condition-case _
+        (make-process
+         :name "asb-discord-upload" :noquery t :buffer nil
+         :sentinel (lambda (_p _e) (ignore-errors (delete-file tmp)))
+         :command (list "curl" "-s" "-X" "POST"
+                        "-F" (format "payload_json=%s"
+                                     (json-encode `(("content" . ,(or caption "")))))
+                        "-F" (format "files[0]=@%s;filename=%s;type=text/plain"
+                                     tmp name)
+                        url))
+      (error (ignore-errors (delete-file tmp)))))
+  nil)
+
+(defvar agent-shell-bridge-discord--upload-fn
+  #'agent-shell-bridge-discord--curl-upload-async
+  "Function of (URL CAPTION NAME DATA) uploading a file.  Rebound in tests.")
+
 (defun agent-shell-bridge-discord--with-wait (url)
   "Append the wait=true query param to URL so the POST returns the message."
   (concat url (if (string-search "?" url) "&" "?") "wait=true"))
@@ -173,24 +222,33 @@ Keeps Emacs responsive -- the mirrored message id is not needed."
                 agent-shell-bridge--session-handle)))
     (and (stringp h) h)))
 
+(defun agent-shell-bridge-discord--target-url ()
+  "The webhook URL for this buffer, threaded under its forum post if any."
+  (let ((thread (agent-shell-bridge-discord--session-thread)))
+    (agent-shell-bridge-discord--with-wait
+     (if thread
+         (format "%s?thread_id=%s" agent-shell-bridge-discord-webhook-url thread)
+       agent-shell-bridge-discord-webhook-url))))
+
 (defun agent-shell-bridge-discord--send (message)
-  "Flatten MESSAGE and POST it to the configured webhook.
-A message that flattens to nil is not posted.  Permission requests post
-synchronously (their id correlates the ✅/❌ reaction); everything else
-fires async so hitting Enter stays snappy.  When the session opened a
-forum post, thread the message under it."
+  "Render MESSAGE and POST it to the configured webhook.
+Renders to nil (not posted), an attachment plist (uploaded as a file
+card, async), or a content string.  Permission strings post synchronously
+\(their id correlates the ✅/❌ reaction); every other string fires async so
+hitting Enter stays snappy.  Threads under the session's forum post."
   (unless agent-shell-bridge-discord-webhook-url
     (error "agent-shell-bridge-discord-webhook-url is not set"))
-  (when-let* ((content (agent-shell-bridge-discord--flatten message)))
-    (let* ((thread (agent-shell-bridge-discord--session-thread))
-           (url (agent-shell-bridge-discord--with-wait
-                 (if thread
-                     (format "%s?thread_id=%s"
-                             agent-shell-bridge-discord-webhook-url thread)
-                   agent-shell-bridge-discord-webhook-url))))
-      (if (eq (plist-get message :role) 'permission)
-          (funcall agent-shell-bridge-discord--post-fn url content)
-        (funcall agent-shell-bridge-discord--post-async-fn url content)))))
+  (when-let* ((payload (agent-shell-bridge-discord--render message)))
+    (let ((url (agent-shell-bridge-discord--target-url)))
+      (pcase payload
+        ((and (pred listp) (guard (plist-get payload :file)))
+         (funcall agent-shell-bridge-discord--upload-fn
+                  url (plist-get payload :caption)
+                  (plist-get payload :file) (plist-get payload :data)))
+        ((pred stringp)
+         (if (eq (plist-get message :role) 'permission)
+             (funcall agent-shell-bridge-discord--post-fn url payload)
+           (funcall agent-shell-bridge-discord--post-async-fn url payload)))))))
 
 ;;; Forum: one post per session
 

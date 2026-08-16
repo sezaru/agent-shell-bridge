@@ -39,13 +39,35 @@
          (out (agent-shell-bridge-discord--flatten m)))
     (should (equal out "🤖 **Agent**\nhello world"))))
 
-(ert-deftest asb-discord-flatten-tool-success-suppressed ()
-  ;; A finished tool's output is not dumped to Discord (it lives in Emacs).
-  (should (null (agent-shell-bridge-discord--flatten
+(ert-deftest asb-discord-flatten-tool-short-output-inline ()
+  ;; Small output shows inline in a plain code block (no grey spoiler box).
+  (let ((out (agent-shell-bridge-discord--render
+              (agent-shell-bridge-make-message
+               :role 'tool :status 'success
+               :parts (list (agent-shell-bridge-make-part
+                             :kind 'tool-call :content "line1\nline2"))))))
+    (should (stringp out))
+    (should (string-prefix-p "✅" out))
+    (should (string-match-p "```\nline1\nline2\n```" out))
+    (should-not (string-match-p "||" out))))
+
+(ert-deftest asb-discord-flatten-tool-large-output-attaches ()
+  ;; Large output becomes a file attachment (Discord's compact collapse).
+  (let* ((big (mapconcat #'number-to-string (number-sequence 1 40) "\n"))
+         (out (agent-shell-bridge-discord--render
+               (agent-shell-bridge-make-message
+                :role 'tool :status 'success
+                :parts (list (agent-shell-bridge-make-part
+                              :kind 'tool-call :content big))))))
+    (should (equal (plist-get out :file) "output.txt"))
+    (should (equal (plist-get out :data) big))))
+
+(ert-deftest asb-discord-flatten-tool-empty-success-suppressed ()
+  (should (null (agent-shell-bridge-discord--render
                  (agent-shell-bridge-make-message
                   :role 'tool :status 'success
                   :parts (list (agent-shell-bridge-make-part
-                                :kind 'tool-call :content "line1\nline2")))))))
+                                :kind 'tool-call :content "")))))))
 
 (ert-deftest asb-discord-flatten-tool-pending-compact-command ()
   (let ((out (agent-shell-bridge-discord--flatten
@@ -66,15 +88,22 @@
     (should (string-match-p "the answer" out))))
 
 (ert-deftest asb-discord-flatten-tool-error-shows-output ()
-  ;; A failure is echoed tersely on one line so it is visible remotely.
-  (let ((err (agent-shell-bridge-discord--flatten
+  ;; A failure keeps its output (inline when small) prefixed with ❌.
+  (let ((err (agent-shell-bridge-discord--render
               (agent-shell-bridge-make-message
                :role 'tool :status 'error
                :parts (list (agent-shell-bridge-make-part
                              :kind 'tool-call :content "boom\nkaboom"))))))
     (should (string-prefix-p "❌" err))
-    (should (string-match-p "boom kaboom" err))   ; one-lined
-    (should-not (string-match-p "\n" err))))
+    (should (string-match-p "```\nboom\nkaboom\n```" err))))
+
+(ert-deftest asb-discord-flatten-tool-empty-error-marked ()
+  (should (equal (agent-shell-bridge-discord--render
+                  (agent-shell-bridge-make-message
+                   :role 'tool :status 'error
+                   :parts (list (agent-shell-bridge-make-part
+                                 :kind 'tool-call :content ""))))
+                 "❌ `(failed)`")))
 
 (ert-deftest asb-discord-flatten-thinking-stays-compact ()
   ;; Long thinking is truncated so the spoiler stays a small bar.
@@ -122,13 +151,30 @@
   (let* ((posted nil)
          (agent-shell-bridge-discord-webhook-url "https://hook")
          (agent-shell-bridge-discord--post-async-fn (lambda (&rest _) (setq posted t)))
+         (agent-shell-bridge-discord--upload-fn (lambda (&rest _) (setq posted t)))
          (agent-shell-bridge-discord--post-fn (lambda (&rest _) (setq posted t))))
+    ;; an empty finished tool has nothing to show
     (should (null (agent-shell-bridge-discord--send
                    (agent-shell-bridge-make-message
                     :role 'tool :status 'success
                     :parts (list (agent-shell-bridge-make-part
-                                  :kind 'tool-call :content "output"))))))
+                                  :kind 'tool-call :content ""))))))
     (should (null posted))))
+
+(ert-deftest asb-discord-send-large-tool-output-uploads ()
+  (let* ((captured nil)
+         (big (mapconcat #'number-to-string (number-sequence 1 40) "\n"))
+         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--upload-fn
+          (lambda (url caption name data)
+            (setq captured (list url caption name data)))))
+    (agent-shell-bridge-discord--send
+     (agent-shell-bridge-make-message
+      :role 'tool :status 'success
+      :parts (list (agent-shell-bridge-make-part :kind 'tool-call :content big))))
+    (should (equal (nth 0 captured) "https://hook?wait=true"))
+    (should (equal (nth 2 captured) "output.txt"))
+    (should (equal (nth 3 captured) big))))
 
 (ert-deftest asb-discord-send-errors-without-webhook-url ()
   (let ((agent-shell-bridge-discord-webhook-url nil))
