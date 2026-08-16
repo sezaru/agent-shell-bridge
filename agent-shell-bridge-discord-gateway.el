@@ -346,6 +346,15 @@ consumed and must not be injected into a conversation that moved on."
 (defvar agent-shell-bridge-discord--heartbeat-timer nil)
 (defvar agent-shell-bridge-discord--swept nil
   "Non-nil once the offline-backlog sweep ran this Emacs session.")
+(defvar agent-shell-bridge-discord--stopping nil
+  "Non-nil while intentionally stopping, to suppress auto-reconnect.")
+
+(defun agent-shell-bridge-discord--schedule-reconnect ()
+  "Reconnect the gateway after a short delay unless we are stopping."
+  (unless agent-shell-bridge-discord--stopping
+    (run-at-time 5 nil
+                 (lambda ()
+                   (ignore-errors (agent-shell-bridge-discord-gateway-connect))))))
 
 (defun agent-shell-bridge-discord--gw-send-json (gw payload)
   (websocket-send-text (agent-shell-bridge-discord-gateway-socket gw)
@@ -391,6 +400,7 @@ consumed and must not be injected into a conversation that moved on."
     (error "The `websocket' package is required for the gateway provider"))
   (unless agent-shell-bridge-discord-bot-token
     (error "agent-shell-bridge-discord-bot-token is not set"))
+  (setq agent-shell-bridge-discord--stopping nil)
   (let ((gw (or agent-shell-bridge-discord--gw
                 (setq agent-shell-bridge-discord--gw
                       (agent-shell-bridge-discord-gateway-create
@@ -400,10 +410,22 @@ consumed and must not be injected into a conversation that moved on."
           (websocket-open
            agent-shell-bridge-discord--gateway-url
            :on-message (lambda (ws frame)
-                         (agent-shell-bridge-discord--gw-on-message gw ws frame))))
+                         (agent-shell-bridge-discord--gw-on-message gw ws frame))
+           :on-close (lambda (_ws)
+                       (when agent-shell-bridge-discord--heartbeat-timer
+                         (cancel-timer agent-shell-bridge-discord--heartbeat-timer)
+                         (setq agent-shell-bridge-discord--heartbeat-timer nil))
+                       (message "agent-shell-bridge: Discord gateway closed%s"
+                                (if agent-shell-bridge-discord--stopping ""
+                                  " (check the Message Content intent); reconnecting in 5s"))
+                       (agent-shell-bridge-discord--schedule-reconnect))
+           :on-error (lambda (_ws type err)
+                       (message "agent-shell-bridge: Discord gateway error: %s %S"
+                                type err))))
     gw))
 
 (defun agent-shell-bridge-discord-gateway--stop ()
+  (setq agent-shell-bridge-discord--stopping t)
   (when agent-shell-bridge-discord--heartbeat-timer
     (cancel-timer agent-shell-bridge-discord--heartbeat-timer)
     (setq agent-shell-bridge-discord--heartbeat-timer nil))
