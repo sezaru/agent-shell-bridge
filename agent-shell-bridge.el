@@ -261,16 +261,64 @@ single complete message on flush."
 (defvar-local agent-shell-bridge--from-remote nil
   "Non-nil while injecting a remote prompt, to avoid echo loops.")
 
+;;; Persist session-id -> provider handle so a resumed agent-shell session
+;;; re-links to its original post instead of creating a new one.
+
+(defcustom agent-shell-bridge-session-file
+  (locate-user-emacs-file "agent-shell-bridge-sessions.eld")
+  "File persisting agent-shell session-id -> provider session handle links."
+  :type 'file
+  :group 'agent-shell-bridge)
+
+(defun agent-shell-bridge--session-id ()
+  "The agent-shell ACP session id of the current buffer, or nil.
+Stable across `session/resume', so it keys the post link."
+  (and (boundp 'agent-shell--state)
+       (ignore-errors (map-nested-elt agent-shell--state '(:session :id)))))
+
+(defun agent-shell-bridge--session-key (session-id)
+  "Namespace SESSION-ID by the active provider (handles differ per provider)."
+  (format "%s/%s"
+          (agent-shell-bridge-provider-name (agent-shell-bridge-active-provider))
+          session-id))
+
+(defun agent-shell-bridge--load-links ()
+  (when (file-exists-p agent-shell-bridge-session-file)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents agent-shell-bridge-session-file)
+        (read (current-buffer))))))
+
+(defun agent-shell-bridge--load-handle (session-id)
+  (cdr (assoc (agent-shell-bridge--session-key session-id)
+              (agent-shell-bridge--load-links))))
+
+(defun agent-shell-bridge--save-handle (session-id handle)
+  (let* ((key (agent-shell-bridge--session-key session-id))
+         (links (cons (cons key handle)
+                      (assoc-delete-all key (agent-shell-bridge--load-links)))))
+    (ignore-errors
+      (make-directory (file-name-directory agent-shell-bridge-session-file) t)
+      (with-temp-file agent-shell-bridge-session-file
+        (prin1 links (current-buffer))))))
+
 (defun agent-shell-bridge--ensure-session (&optional title)
-  "Open this buffer's provider session once, titled TITLE."
+  "Open this buffer's provider session once, titled TITLE.
+Reuse the persisted post for a resumed session-id instead of creating a
+new one."
   (unless agent-shell-bridge--session-started
     (setq agent-shell-bridge--session-started t)
     (let* ((provider (agent-shell-bridge-active-provider))
-           (handle (funcall (agent-shell-bridge-provider-start-session provider)
-                            (list :name (buffer-name) :title title))))
+           (session-id (agent-shell-bridge--session-id))
+           (existing (and session-id (agent-shell-bridge--load-handle session-id)))
+           (handle (or existing
+                       (funcall (agent-shell-bridge-provider-start-session provider)
+                                (list :name (buffer-name) :title title)))))
       (setq agent-shell-bridge--session-handle handle)
       (when handle
-        (puthash handle (current-buffer) agent-shell-bridge--session->buffer)))))
+        (puthash handle (current-buffer) agent-shell-bridge--session->buffer)
+        (when (and session-id (not existing))
+          (agent-shell-bridge--save-handle session-id handle))))))
 
 (defun agent-shell-bridge--active-buffers ()
   "Buffers with `agent-shell-bridge-mode' enabled."

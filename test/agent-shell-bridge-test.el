@@ -201,6 +201,47 @@
                    "Refactor the parser"))
     (should (equal (agent-shell-bridge-message-text (nth 1 sends)) "now the AST"))))
 
+(ert-deftest asb-session-link-round-trips ()
+  (let ((agent-shell-bridge-session-file
+         (make-temp-file "asb-sessions" nil ".eld")))
+    (unwind-protect
+        (progn
+          (agent-shell-bridge-register-provider
+           (agent-shell-bridge-provider-create :name 'discord :start-session #'ignore
+            :send #'ignore :edit #'ignore :delete #'ignore :on-inbound #'ignore
+            :on-control #'ignore :stop #'ignore))
+          (agent-shell-bridge-set-provider 'discord)
+          (agent-shell-bridge--save-handle "sid-1" "thread-1")
+          (should (equal (agent-shell-bridge--load-handle "sid-1") "thread-1"))
+          (should (null (agent-shell-bridge--load-handle "sid-2"))))
+      (delete-file agent-shell-bridge-session-file))))
+
+(ert-deftest asb-ensure-session-reuses-persisted-post-on-resume ()
+  (let ((agent-shell-bridge-session-file
+         (make-temp-file "asb-sessions" nil ".eld"))
+        (created 0))
+    (unwind-protect
+        (let ((provider (agent-shell-bridge-provider-create
+                         :name 'discord
+                         :start-session (lambda (_m) (cl-incf created) "new-thread")
+                         :send #'ignore :edit #'ignore :delete #'ignore
+                         :on-inbound #'ignore :on-control #'ignore :stop #'ignore)))
+          (agent-shell-bridge-register-provider provider)
+          (agent-shell-bridge-set-provider 'discord)
+          ;; first run: no link yet -> create + persist
+          (with-temp-buffer
+            (setq-local agent-shell--state '((:session . ((:id . "sid-9")))))
+            (agent-shell-bridge--ensure-session "Title")
+            (should (= created 1))
+            (should (equal agent-shell-bridge--session-handle "new-thread")))
+          ;; resume (fresh buffer, same session id): reuse, do NOT create
+          (with-temp-buffer
+            (setq-local agent-shell--state '((:session . ((:id . "sid-9")))))
+            (agent-shell-bridge--ensure-session "Title")
+            (should (= created 1))
+            (should (equal agent-shell-bridge--session-handle "new-thread"))))
+      (delete-file agent-shell-bridge-session-file))))
+
 (ert-deftest asb-send-command-uses-first-prompt-as-title ()
   (let* ((started nil)
          (provider (agent-shell-bridge-provider-create
