@@ -292,10 +292,16 @@ Run on a cold reconnect: the client was offline, so these were never
 consumed and must not be injected into a conversation that moved on."
   (let* ((resp (agent-shell-bridge-discord--rest
                 "GET" (format "/channels/%s/messages?limit=50" channel-id)))
-         (stale (agent-shell-bridge-discord--unprocessed-user-messages resp)))
+         (pending (agent-shell-bridge-discord--pending-reaction-message-ids))
+         ;; A message with a queued (persisted) reaction was already handled
+         ;; before shutdown -- its ack just had not landed yet.  Skip it, or
+         ;; we would reject an already-processed message as offline backlog.
+         (stale (seq-remove
+                 (lambda (m) (member (alist-get 'id m) pending))
+                 (agent-shell-bridge-discord--unprocessed-user-messages resp))))
     (agent-shell-bridge--log
-     "reject-stale: channel=%s fetched=%s stale-ids=%S"
-     channel-id (length (append resp nil))
+     "reject-stale: channel=%s fetched=%s pending=%S stale-ids=%S"
+     channel-id (length (append resp nil)) pending
      (mapcar (lambda (m) (alist-get 'id m)) stale))
     (dolist (m stale)
       (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
@@ -491,6 +497,10 @@ instance's or session's posts."
   (interactive)
   (agent-shell-bridge-register-provider (agent-shell-bridge-discord-provider))
   (agent-shell-bridge-set-provider 'discord)
+  ;; Resume reactions left pending when Emacs last closed BEFORE the sweep
+  ;; runs, so a not-yet-landed ack marks its message rather than the sweep
+  ;; rejecting it as backlog.
+  (agent-shell-bridge-discord--rest-load)
   ;; On resume, reject whatever was typed into the post while we were closed.
   (add-hook 'agent-shell-bridge--relink-functions
             #'agent-shell-bridge-discord--reject-relinked-backlog)

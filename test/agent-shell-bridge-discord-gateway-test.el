@@ -109,16 +109,21 @@
     (should (member "-d" (agent-shell-bridge-discord--rest-args
                           "POST" "/x" '((content . "hi")))))))
 
-(ert-deftest asb-gw-rest-put-fires-async-with-list-command ()
-  "Reactions (PUT/DELETE) fire async via make-process so Emacs never blocks.
-`:command' MUST be the full curl list -- the old code `apply'd it, spreading
-curl's flags into make-process keyword slots so no reaction ever fired."
-  (let ((agent-shell-bridge-discord-bot-token "TK") (captured nil) (calls 0))
-    (cl-letf (((symbol-function 'make-process)
+(ert-deftest asb-gw-rest-put-queues-and-fires-list-command ()
+  "Reactions (PUT/DELETE) go through the serialized queue and fire async via
+make-process.  `:command' MUST be the full curl list -- the old code
+`apply'd it, spreading curl's flags into make-process keyword slots so no
+reaction ever fired."
+  (let ((agent-shell-bridge-discord-bot-token "TK")
+        (agent-shell-bridge-discord--rest-queue nil)
+        (agent-shell-bridge-discord--rest-current nil)
+        (captured nil) (calls 0))
+    (cl-letf (((symbol-function 'agent-shell-bridge-discord--rest-persist) #'ignore)
+              ((symbol-function 'make-process)
                (lambda (&rest args) (setq captured args) (cl-incf calls) 'proc)))
       (agent-shell-bridge-discord--rest-request
        "PUT" "/channels/c/messages/m/reactions/x/@me" nil))
-    (should (= calls 1))
+    (should (= calls 1))                           ; pump fired one request
     (let ((command (plist-get captured :command)))
       (should (listp command))                     ; not the bare string "curl"
       (should (equal (car command) "curl"))
@@ -126,24 +131,105 @@ curl's flags into make-process keyword slots so no reaction ever fired."
       (should (seq-every-p #'stringp command)))
     (should (cl-loop for (k _v) on captured by #'cddr always (keywordp k)))))
 
-(ert-deftest asb-gw-rest-async-sentinel-logs-discord-error ()
-  "The async PUT/DELETE sentinel inspects the response and surfaces a
-Discord error body via `message', so a rejected reaction is not silent."
+(ert-deftest asb-gw-rest-serializes-one-in-flight ()
+  "A second PUT does not fire while the first is still in flight -- it waits
+in the queue so reactions never burst and rate-limit each other."
   (let ((agent-shell-bridge-discord-bot-token "TK")
-        (logged nil) (sentinel nil) (procbuf nil))
-    (cl-letf (((symbol-function 'make-process)
-               (lambda (&rest args)
-                 (setq sentinel (plist-get args :sentinel)
-                       procbuf (plist-get args :buffer))
-                 'proc))
-              ((symbol-function 'process-status) (lambda (_) 'exit))
+        (agent-shell-bridge-discord--rest-queue nil)
+        (agent-shell-bridge-discord--rest-current nil)
+        (calls 0))
+    (cl-letf (((symbol-function 'agent-shell-bridge-discord--rest-persist) #'ignore)
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (cl-incf calls) 'proc)))
+      (agent-shell-bridge-discord--rest-request "PUT" "/a" nil)
+      (agent-shell-bridge-discord--rest-request "PUT" "/b" nil))
+    (should (= calls 1))                           ; only the first fired
+    (should (= (length agent-shell-bridge-discord--rest-queue) 1)))) ; /b waits
+
+(ert-deftest asb-gw-rest-429-requeues-with-incremented-attempt ()
+  "A 429 (retry_after present) re-queues the in-flight request for a retry."
+  (let ((agent-shell-bridge-discord-bot-token "TK")
+        (agent-shell-bridge-discord--rest-queue nil)
+        (agent-shell-bridge-discord--rest-current '("PUT" "/a" nil 0))
+        (scheduled nil))
+    (cl-letf (((symbol-function 'agent-shell-bridge-discord--rest-persist) #'ignore)
+              ((symbol-function 'agent-shell-bridge-discord--rest-pump) #'ignore)
+              ((symbol-function 'run-at-time)
+               (lambda (_secs _rep fn) (setq scheduled fn) nil)))
+      (with-temp-buffer
+        (insert "{\"message\":\"You are being rate limited.\",\"retry_after\":0.3}")
+        (agent-shell-bridge-discord--rest-complete (current-buffer) "finished"))
+      (should scheduled)                           ; a retry was scheduled
+      (funcall scheduled))                         ; simulate the timer firing
+    (should (equal agent-shell-bridge-discord--rest-queue
+                   '(("PUT" "/a" nil 1))))         ; re-queued, attempt bumped
+    (should (null agent-shell-bridge-discord--rest-current))))
+
+(ert-deftest asb-gw-rest-complete-logs-non-429-error ()
+  "A real Discord error (code + message, no retry_after) surfaces via
+`message' and does not re-queue."
+  (let ((agent-shell-bridge-discord-bot-token "TK")
+        (agent-shell-bridge-discord--rest-queue nil)
+        (agent-shell-bridge-discord--rest-current '("PUT" "/x" nil 0))
+        (logged nil))
+    (cl-letf (((symbol-function 'agent-shell-bridge-discord--rest-persist) #'ignore)
+              ((symbol-function 'agent-shell-bridge-discord--rest-pump) #'ignore)
               ((symbol-function 'message)
                (lambda (fmt &rest a) (setq logged (apply #'format fmt a)))))
-      (agent-shell-bridge-discord--rest-request "PUT" "/x" nil)
-      (with-current-buffer procbuf
-        (insert "{\"message\":\"Missing Access\",\"code\":50001}"))
-      (funcall sentinel 'proc "finished\n"))
-    (should (string-match-p "Missing Access" logged))))
+      (with-temp-buffer
+        (insert "{\"message\":\"Missing Access\",\"code\":50001}")
+        (agent-shell-bridge-discord--rest-complete (current-buffer) "finished")))
+    (should (string-match-p "Missing Access" logged))
+    (should (null agent-shell-bridge-discord--rest-queue))
+    (should (null agent-shell-bridge-discord--rest-current))))
+
+(ert-deftest asb-gw-rest-queue-persists-and-reloads ()
+  "The pending queue survives a restart: persist to a file, then load it
+back into a fresh (empty) queue."
+  (let ((tmp (make-temp-file "asb-queue" nil ".eld")))
+    (unwind-protect
+        (let ((agent-shell-bridge-discord-queue-file tmp)
+              (agent-shell-bridge-discord--rest-current '("PUT" "/a/reactions/x" nil 2))
+              (agent-shell-bridge-discord--rest-queue '(("DELETE" "/b" nil 0))))
+          (agent-shell-bridge-discord--rest-persist)
+          (let ((agent-shell-bridge-discord--rest-current nil)
+                (agent-shell-bridge-discord--rest-queue nil))
+            (cl-letf (((symbol-function 'agent-shell-bridge-discord--rest-pump) #'ignore))
+              (agent-shell-bridge-discord--rest-load))
+            ;; both the in-flight and queued request come back, in order
+            (should (equal agent-shell-bridge-discord--rest-queue
+                           '(("PUT" "/a/reactions/x" nil 2)
+                             ("DELETE" "/b" nil 0))))))
+      (delete-file tmp))))
+
+(ert-deftest asb-gw-pending-reaction-ids-extracted-from-paths ()
+  (let ((agent-shell-bridge-discord--rest-current
+         '("PUT" "/channels/c/messages/111/reactions/x/@me" nil 0))
+        (agent-shell-bridge-discord--rest-queue
+         '(("DELETE" "/channels/c/messages/222/reactions/y/@me" nil 0)
+           ("PUT" "/channels/c/messages" nil 0)))) ; not a reaction -> ignored
+    (should (equal (sort (agent-shell-bridge-discord--pending-reaction-message-ids)
+                         #'string<)
+                   '("111" "222")))))
+
+(ert-deftest asb-gw-reject-stale-skips-pending-reaction-messages ()
+  "A message with a queued (persisted) reaction was already handled -- the
+resume sweep must not reject it as offline backlog."
+  (let* ((marked nil)
+         (agent-shell-bridge-discord--rest-current nil)
+         ;; message 111 already has a pending ✅ from before shutdown
+         (agent-shell-bridge-discord--rest-queue
+          '(("PUT" "/channels/c/messages/111/reactions/x/@me" nil 0)))
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path _b)
+            (cond ((equal method "GET")
+                   (vector '((id . "111") (author . ((id . "u1"))))    ; handled
+                           '((id . "222") (author . ((id . "u1"))))))  ; real backlog
+                  ((equal method "PUT") (push path marked) nil)))))
+    (agent-shell-bridge-discord--reject-stale "c")
+    ;; only 222 (the genuine backlog) is rejected; 111 is skipped
+    (should (= (length marked) 1))
+    (should (string-match-p "/messages/222/" (car marked)))))
 
 (ert-deftest asb-gw-rest-get-is-synchronous-and-parses ()
   "GET/POST run synchronously (never make-process) and return parsed JSON."

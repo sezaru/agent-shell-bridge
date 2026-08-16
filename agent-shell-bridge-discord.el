@@ -82,59 +82,158 @@ it survives, yielding one blank line of separation.")
    (when body (list "-d" (json-encode body)))
    (list (concat agent-shell-bridge-discord--api-base path))))
 
-(defun agent-shell-bridge-discord--rest-log-error (method path buffer)
-  "Log a Discord error body (message + code) found in BUFFER, if any.
-For the METHOD PATH request; keeps failed reactions from being silent."
-  (when (buffer-live-p buffer)
-    (let ((resp (ignore-errors
-                  (with-current-buffer buffer
-                    (json-parse-string (buffer-string) :object-type 'alist)))))
-      (when (and (listp resp) (alist-get 'code resp) (alist-get 'message resp))
-        (message "agent-shell-bridge: Discord %s %s failed: %s"
-                 method path (alist-get 'message resp))))))
+;; Reactions and status swaps share Discord's tight per-channel reaction
+;; rate limit.  Fired concurrently they 429 each other -- an ack or a
+;; status-removal silently vanishes.  So every PUT/DELETE goes through one
+;; FIFO worker that sends a single request at a time and, on a 429, re-sends
+;; after the server-specified `retry_after'.  The queue is PERSISTED to disk:
+;; reactions still pending when Emacs closes are re-sent on the next start,
+;; so a resumed session never wrongly rejects an already-handled message
+;; whose ack had not yet landed.  GET/POST/PATCH stay synchronous (their
+;; caller needs the result) and are not queued.
+
+(defcustom agent-shell-bridge-discord-queue-file
+  (expand-file-name "agent-shell-bridge-discord-queue.eld" user-emacs-directory)
+  "File the pending reaction/status queue is persisted to across restarts."
+  :type 'file
+  :group 'agent-shell-bridge)
+
+(defvar agent-shell-bridge-discord--rest-queue nil
+  "Pending async requests, each (METHOD PATH BODY ATTEMPTS).")
+
+(defvar agent-shell-bridge-discord--rest-current nil
+  "The request in flight (METHOD PATH BODY ATTEMPTS), or nil when idle.")
+
+(defconst agent-shell-bridge-discord--rest-max-attempts 6
+  "Give up on a rate-limited request after this many tries.")
+
+(defun agent-shell-bridge-discord--rest-pending ()
+  "All not-yet-confirmed requests: the in-flight one plus the queue."
+  (append (and agent-shell-bridge-discord--rest-current
+               (list agent-shell-bridge-discord--rest-current))
+          agent-shell-bridge-discord--rest-queue))
+
+(defun agent-shell-bridge-discord--rest-persist ()
+  "Write the pending requests to `agent-shell-bridge-discord-queue-file'."
+  (ignore-errors
+    (with-temp-file agent-shell-bridge-discord-queue-file
+      (let ((print-length nil) (print-level nil))
+        (prin1 (agent-shell-bridge-discord--rest-pending) (current-buffer))))))
+
+(defun agent-shell-bridge-discord--rest-load ()
+  "Re-enqueue requests persisted by a previous session and resume sending."
+  (when (file-exists-p agent-shell-bridge-discord-queue-file)
+    (let ((saved (ignore-errors
+                   (with-temp-buffer
+                     (insert-file-contents agent-shell-bridge-discord-queue-file)
+                     (read (current-buffer))))))
+      (when (and saved (listp saved))
+        (agent-shell-bridge--log "rest: resuming %d persisted request(s)"
+                                 (length saved))
+        (setq agent-shell-bridge-discord--rest-queue
+              (append saved agent-shell-bridge-discord--rest-queue))
+        (agent-shell-bridge-discord--rest-pump)))))
+
+(defun agent-shell-bridge-discord--rest-message-id (req)
+  "The message-id a reaction REQUEST (METHOD PATH ...) targets, or nil."
+  (let ((path (nth 1 req)))
+    (when (and path (string-match "/messages/\\([0-9]+\\)/reactions/" path))
+      (match-string 1 path))))
+
+(defun agent-shell-bridge-discord--pending-reaction-message-ids ()
+  "Message-ids that still have a queued (unconfirmed) reaction."
+  (delq nil (mapcar #'agent-shell-bridge-discord--rest-message-id
+                    (agent-shell-bridge-discord--rest-pending))))
+
+(defun agent-shell-bridge-discord--rest-enqueue (method path body)
+  "Queue an async METHOD PATH BODY request and kick the worker."
+  (setq agent-shell-bridge-discord--rest-queue
+        (append agent-shell-bridge-discord--rest-queue
+                (list (list method path body 0))))
+  (agent-shell-bridge-discord--rest-persist)
+  (agent-shell-bridge-discord--rest-pump))
+
+(defun agent-shell-bridge-discord--rest-advance ()
+  "Finish the in-flight request and start the next queued one."
+  (setq agent-shell-bridge-discord--rest-current nil)
+  (agent-shell-bridge-discord--rest-persist)
+  (agent-shell-bridge-discord--rest-pump))
+
+(defun agent-shell-bridge-discord--rest-pump ()
+  "If idle, send the next queued request one at a time."
+  (when (and (not agent-shell-bridge-discord--rest-current)
+             agent-shell-bridge-discord--rest-queue)
+    (setq agent-shell-bridge-discord--rest-current
+          (pop agent-shell-bridge-discord--rest-queue))
+    (agent-shell-bridge-discord--rest-persist)
+    (pcase-let ((`(,method ,path ,body ,attempts)
+                 agent-shell-bridge-discord--rest-current))
+      (let ((buf (generate-new-buffer " *asb-discord-rest*"))
+            (args (agent-shell-bridge-discord--rest-args method path body)))
+        (agent-shell-bridge--log "rest: %s %s (async attempt %d)"
+                                 method path (1+ attempts))
+        ;; NB: `:command' must receive the list itself -- never `apply' the
+        ;; args, or curl's flags become make-process keywords and it never fires.
+        (condition-case err
+            (make-process
+             :name "asb-discord-rest" :noquery t :buffer buf
+             :command (cons "curl" args)
+             :sentinel
+             (lambda (proc event)
+               (when (memq (process-status proc) '(exit signal))
+                 (agent-shell-bridge-discord--rest-complete
+                  buf (string-trim event)))))
+          (error
+           (agent-shell-bridge--log "rest: %s %s make-process FAILED: %S"
+                                    method path err)
+           (ignore-errors (kill-buffer buf))
+           (agent-shell-bridge-discord--rest-advance)))))))
+
+(defun agent-shell-bridge-discord--rest-complete (buf event)
+  "Handle completion of the in-flight request; retry on 429, else advance."
+  (pcase-let ((`(,method ,path ,body ,attempts)
+               agent-shell-bridge-discord--rest-current))
+    (let* ((out (if (buffer-live-p buf)
+                    (with-current-buffer buf (buffer-string)) ""))
+           (resp (ignore-errors (json-parse-string out :object-type 'alist)))
+           (retry (and (listp resp) (alist-get 'retry_after resp))))
+      (agent-shell-bridge--log "rest: %s %s -> %s body=%S" method path event
+                               (substring out 0 (min 160 (length out))))
+      (ignore-errors (kill-buffer buf))
+      (cond
+       ((and retry (< (1+ attempts) agent-shell-bridge-discord--rest-max-attempts))
+        (agent-shell-bridge--log "rest: %s %s rate-limited; retry in %ss (attempt %d)"
+                                 method path retry (1+ attempts))
+        (run-at-time
+         (+ (if (numberp retry) retry 1) 0.1) nil
+         (lambda ()
+           ;; Re-send this exact request ahead of newer ones so a status
+           ;; DELETE/PUT swap keeps its order.
+           (push (list method path body (1+ attempts))
+                 agent-shell-bridge-discord--rest-queue)
+           (agent-shell-bridge-discord--rest-advance))))
+       (t
+        (when (and (listp resp) (alist-get 'code resp) (alist-get 'message resp))
+          (message "agent-shell-bridge: Discord %s %s failed: %s"
+                   method path (alist-get 'message resp)))
+        (agent-shell-bridge-discord--rest-advance))))))
 
 (defun agent-shell-bridge-discord--rest-request (method path body)
   "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
-Reactions and status swaps (PUT/DELETE) fire asynchronously so Emacs never
-blocks on them -- but the sentinel inspects the response and logs any
-Discord error, so a failed reaction surfaces instead of being silently
-dropped.  GET/POST/PATCH run synchronously and return the decoded JSON
-response (or nil), since their caller needs the result."
-  (agent-shell-bridge--log "rest: %s %s%s" method path
-                           (if (member method '("PUT" "DELETE")) " (async)" ""))
-  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
-    (if (member method '("PUT" "DELETE"))
-        (let ((buf (generate-new-buffer " *asb-discord-rest*")))
-          ;; NB: `:command' must receive the list itself -- never `apply' the
-          ;; args, or curl's flags get parsed as make-process keywords and the
-          ;; request silently never fires (breaking every reaction).
-          (condition-case err
-              (make-process
-               :name "asb-discord-rest" :noquery t :buffer buf
-               :command (cons "curl" args)
-               :sentinel
-               (lambda (proc event)
-                 (when (memq (process-status proc) '(exit signal))
-                   (agent-shell-bridge--log
-                    "rest: %s %s -> exit=%s body=%S" method path
-                    (string-trim event)
-                    (with-current-buffer buf
-                      (let ((s (buffer-string)))
-                        (substring s 0 (min 200 (length s))))))
-                   (agent-shell-bridge-discord--rest-log-error method path buf)
-                   (ignore-errors (kill-buffer buf)))))
-            (error
-             (agent-shell-bridge--log "rest: %s %s make-process FAILED: %S"
-                                      method path err)
-             (ignore-errors (kill-buffer buf))))
-          nil)
-      (let* ((out (with-output-to-string
-                    (with-current-buffer standard-output
-                      (apply #'call-process "curl" nil t nil args))))
-             (resp (ignore-errors (json-parse-string out :object-type 'alist))))
-        (agent-shell-bridge--log "rest: %s %s -> body=%S" method path
-                                 (substring out 0 (min 200 (length out))))
-        resp))))
+Reactions and status swaps (PUT/DELETE) are queued (persisted) and sent one
+at a time with 429 retry, so Emacs never blocks and no reaction is dropped
+-- even across a restart.  GET/POST/PATCH run synchronously and return the
+decoded JSON response (or nil), since their caller needs the result."
+  (if (member method '("PUT" "DELETE"))
+      (progn (agent-shell-bridge-discord--rest-enqueue method path body) nil)
+    (let* ((args (agent-shell-bridge-discord--rest-args method path body))
+           (out (with-output-to-string
+                  (with-current-buffer standard-output
+                    (apply #'call-process "curl" nil t nil args))))
+           (resp (ignore-errors (json-parse-string out :object-type 'alist))))
+      (agent-shell-bridge--log "rest: %s %s -> body=%S" method path
+                               (substring out 0 (min 160 (length out))))
+      resp)))
 
 (defvar agent-shell-bridge-discord--rest-fn
   #'agent-shell-bridge-discord--rest-request
