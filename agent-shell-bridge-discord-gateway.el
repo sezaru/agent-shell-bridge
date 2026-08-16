@@ -26,6 +26,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'map)
+(require 'url-util)
 (require 'agent-shell-bridge)
 (require 'agent-shell-bridge-provider)
 (require 'agent-shell-bridge-discord)
@@ -126,7 +127,10 @@ Ignores the bot's own messages and empty content."
                (not is-bot)
                (not (equal author-id
                            (agent-shell-bridge-discord-gateway-bot-user-id gw))))
-      (funcall cb (list :text content :session channel)))))
+      ;; Live message: consume it and mark it ✅ so a later cold reconnect
+      ;; won't mistake it for offline backlog.
+      (funcall cb (list :text content :session channel))
+      (agent-shell-bridge-discord--mark channel (alist-get 'id d) t))))
 
 (defun agent-shell-bridge-discord--route-reaction (gw d)
   "Route a MESSAGE_REACTION_ADD/REMOVE payload D through GW's control callback."
@@ -220,6 +224,54 @@ Return the decoded JSON response, or nil."
    "DELETE"
    (format "/channels/%s/messages/%s"
            agent-shell-bridge-discord-channel-id remote-id)))
+
+;;;; Reaction markers: ✅ consumed, ❌ rejected
+
+(defconst agent-shell-bridge-discord--mark-consumed "✅")
+(defconst agent-shell-bridge-discord--mark-rejected "❌")
+
+(defun agent-shell-bridge-discord--react (channel-id message-id emoji)
+  "Add EMOJI as the bot's reaction to MESSAGE-ID in CHANNEL-ID."
+  (agent-shell-bridge-discord--rest
+   "PUT"
+   (format "/channels/%s/messages/%s/reactions/%s/@me"
+           channel-id message-id (url-hexify-string emoji))))
+
+(defun agent-shell-bridge-discord--mark (channel-id message-id consumed)
+  "Mark MESSAGE-ID consumed (✅) when CONSUMED, else rejected (❌)."
+  (agent-shell-bridge-discord--react
+   channel-id message-id
+   (if consumed agent-shell-bridge-discord--mark-consumed
+     agent-shell-bridge-discord--mark-rejected)))
+
+(defun agent-shell-bridge-discord--bot-marked-p (message)
+  "Non-nil if the bot already reacted ✅/❌ to MESSAGE."
+  (seq-some (lambda (r)
+              (and (eq (alist-get 'me r) t)
+                   (member (alist-get 'name (alist-get 'emoji r))
+                           (list agent-shell-bridge-discord--mark-consumed
+                                 agent-shell-bridge-discord--mark-rejected))))
+            (append (alist-get 'reactions message) nil)))
+
+(defun agent-shell-bridge-discord--unprocessed-user-messages (messages)
+  "Return the user-authored MESSAGES the bot has not yet marked.
+These are the backlog typed while Emacs was offline -- to be rejected."
+  (seq-filter
+   (lambda (m)
+     (and (not (eq (alist-get 'bot (alist-get 'author m)) t))
+          (not (agent-shell-bridge-discord--bot-marked-p m))))
+   (append messages nil)))
+
+(defun agent-shell-bridge-discord--reject-stale (channel-id)
+  "Reject (❌) every unprocessed user message in CHANNEL-ID; return them.
+Run on a cold reconnect: the client was offline, so these were never
+consumed and must not be injected into a conversation that moved on."
+  (let* ((resp (agent-shell-bridge-discord--rest
+                "GET" (format "/channels/%s/messages?limit=50" channel-id)))
+         (stale (agent-shell-bridge-discord--unprocessed-user-messages resp)))
+    (dolist (m stale)
+      (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
+    stale))
 
 ;;;; Live connection (guarded; not unit tested)
 

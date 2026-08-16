@@ -128,5 +128,73 @@
       (should (equal (nth 0 call) "PATCH"))
       (should (equal (nth 1 call) "/channels/chan-1/messages/m-9")))))
 
+;;;; Reaction markers
+
+(ert-deftest asb-gw-react-builds-put-reaction-path ()
+  (let* ((calls nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (m p _b) (push (list m p) calls) nil)))
+    (agent-shell-bridge-discord--react "chan-1" "msg-1" "✅")
+    (let ((call (car calls)))
+      (should (equal (nth 0 call) "PUT"))
+      (should (string-prefix-p "/channels/chan-1/messages/msg-1/reactions/" (nth 1 call)))
+      (should (string-suffix-p "/@me" (nth 1 call))))))
+
+(ert-deftest asb-gw-mark-picks-consumed-or-rejected ()
+  (let* ((emojis nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (_m p _b) (push p emojis) nil)))
+    (agent-shell-bridge-discord--mark "c" "m" t)
+    (agent-shell-bridge-discord--mark "c" "m" nil)
+    (setq emojis (reverse emojis))       ; chronological
+    (should (string-match-p (url-hexify-string "✅") (nth 0 emojis)))
+    (should (string-match-p (url-hexify-string "❌") (nth 1 emojis)))))
+
+(ert-deftest asb-gw-bot-marked-p-detects-own-reaction ()
+  (should (agent-shell-bridge-discord--bot-marked-p
+           '((reactions . [((me . t) (emoji . ((name . "✅"))))]))))
+  (should-not (agent-shell-bridge-discord--bot-marked-p
+               '((reactions . [((me . :false) (emoji . ((name . "👍"))))]))))
+  (should-not (agent-shell-bridge-discord--bot-marked-p '())))
+
+(ert-deftest asb-gw-unprocessed-filters-bot-and-marked ()
+  (let ((messages
+         (vector
+          '((id . "a") (content . "run this") (author . ((id . "u1"))))          ; unprocessed
+          '((id . "b") (content . "bot msg") (author . ((id . "bot") (bot . t)))) ; bot -> skip
+          '((id . "c") (content . "already") (author . ((id . "u1")))
+            (reactions . [((me . t) (emoji . ((name . "✅"))))])))))              ; marked -> skip
+    (let ((ids (mapcar (lambda (m) (alist-get 'id m))
+                       (agent-shell-bridge-discord--unprocessed-user-messages messages))))
+      (should (equal ids '("a"))))))
+
+(ert-deftest asb-gw-reject-stale-marks-each-with-x ()
+  (let* ((puts nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path _b)
+            (cond ((equal method "GET")
+                   (vector '((id . "a") (author . ((id . "u1"))))
+                           '((id . "b") (author . ((id . "u1"))))))
+                  ((equal method "PUT") (push path puts) nil)))))
+    (agent-shell-bridge-discord--reject-stale "chan-1")
+    (should (= (length puts) 2))
+    (should (seq-every-p (lambda (p) (string-match-p (url-hexify-string "❌") p)) puts))))
+
+(ert-deftest asb-gw-live-message-gets-consumed-mark ()
+  (let* ((puts nil) (injected nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path _b) (when (equal method "PUT") (push path puts)) nil))
+         (gw (agent-shell-bridge-discord-gateway-create
+              :bot-user-id "bot-99"
+              :on-inbound (lambda (ev) (setq injected ev)))))
+    (agent-shell-bridge-discord--on-gateway-event
+     gw '((op . 0) (t . "MESSAGE_CREATE")
+          (d . ((id . "m-7") (content . "do it")
+                (channel_id . "chan-1") (author . ((id . "u1")))))))
+    (should (equal (plist-get injected :text) "do it"))
+    (should (= (length puts) 1))
+    (should (string-match-p "/messages/m-7/reactions/" (car puts)))
+    (should (string-match-p (url-hexify-string "✅") (car puts)))))
+
 (provide 'agent-shell-bridge-discord-gateway-test)
 ;;; agent-shell-bridge-discord-gateway-test.el ends here
