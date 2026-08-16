@@ -151,25 +151,13 @@ response we do not need back."
 ;; can consume every thinking chunk and tool call instead of discarding
 ;; them.
 
-(defconst agent-shell-bridge-discord--role-color
-  '((agent . "36") (user . "33") (permission . "31"))
-  "ANSI SGR color code per role (cyan / yellow / red).
-Discord renders coloured text only inside an ```ansi code block, so the
-role label is wrapped in one; roles absent here fall back to plain bold.")
-
 (defun agent-shell-bridge-discord--header (message)
-  "Coloured role header for MESSAGE (agent/user/permission/system only)."
-  (let* ((role (plist-get message :role))
-         (label (pcase role
-                  ('agent "🤖 Agent")
-                  ('user "🧑 User")
-                  ('permission "⚠️ Permission Required")
-                  (_ "ℹ️ System")))
-         (color (alist-get role agent-shell-bridge-discord--role-color)))
-    (if color
-        ;; An ```ansi fence is the only way to colour text in Discord.
-        (format "```ansi\n\e[1;%sm%s\e[0m\n```" color label)
-      (format "**%s**" label))))
+  "Role header line for MESSAGE (agent/user/permission/system only)."
+  (pcase (plist-get message :role)
+    ('agent "🤖 **Agent** >")
+    ('user "🧑 **User** >")
+    ('permission "⚠️ **Permission Required** >")
+    (_ "ℹ️ **System** >")))
 
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
   "Flatten a foreground MESSAGE (agent/user/permission/system) to a string.

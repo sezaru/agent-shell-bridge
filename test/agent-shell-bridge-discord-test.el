@@ -30,10 +30,7 @@
              :parts (list (agent-shell-bridge-make-part
                            :kind 'text :content "hello world"))))
          (out (agent-shell-bridge-discord--flatten m)))
-    ;; header is a coloured ```ansi block, body follows verbatim
-    (should (string-match-p "```ansi" out))
-    (should (string-match-p "Agent" out))
-    (should (string-suffix-p "\nhello world" out))))
+    (should (equal out "🤖 **Agent** >\nhello world"))))
 
 (ert-deftest asb-discord-flatten-agent-not-collapsed ()
   (let ((out (agent-shell-bridge-discord--flatten
@@ -138,8 +135,7 @@
     (should (null sync-called))
     ;; no session handle -> posts to the configured channel
     (should (equal (nth 0 captured) "chan-1"))
-    (should (string-match-p "```ansi" (nth 1 captured)))
-    (should (string-match-p "\nhi" (nth 1 captured)))
+    (should (string-prefix-p "🤖 **Agent** >\nhi" (nth 1 captured)))
     ;; each message ends with the blank-line separator
     (should (string-suffix-p agent-shell-bridge-discord--separator (nth 1 captured)))))
 
