@@ -274,17 +274,24 @@ single complete message on flush."
 
 (defun agent-shell-bridge-inject (text &optional buffer)
   "Inject TEXT as a prompt into BUFFER (an `agent-shell' buffer).
-Queues when the shell is busy."
+When the shell is busy the prompt is queued and auto-runs after the
+current turn -- it never interrupts a running turn (use the interrupt
+control for that).  Submitted without stealing focus."
   (with-current-buffer (or buffer (current-buffer))
     (when (derived-mode-p 'agent-shell-mode)
-      (if (and (fboundp 'shell-maker-busy) (shell-maker-busy))
-          (when (fboundp 'agent-shell--enqueue-request)
-            (agent-shell--enqueue-request :prompt text))
-        (setq agent-shell-bridge--from-remote t)
+      (setq agent-shell-bridge--from-remote t)
+      (cond
+       ((and (fboundp 'shell-maker-busy) (shell-maker-busy)
+             (fboundp 'agent-shell--prompt-queue-enqueue))
+        (agent-shell--prompt-queue-enqueue :prompt text))
+       ((fboundp 'agent-shell--insert-to-shell-buffer)
+        (agent-shell--insert-to-shell-buffer
+         :shell-buffer (current-buffer) :text text :submit t :no-focus t))
+       (t
         (save-excursion (goto-char (point-max)) (insert text))
         (goto-char (point-max))
         (when (fboundp 'shell-maker-submit)
-          (call-interactively #'shell-maker-submit))))))
+          (call-interactively #'shell-maker-submit)))))))
 
 (defun agent-shell-bridge--dispatch-inbound (event)
   "Handle an inbound EVENT (:text :session) by injecting into its buffer."
