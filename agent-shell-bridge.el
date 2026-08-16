@@ -111,6 +111,7 @@ UPDATE is the value of (params update) in an ACP session notification."
     ("tool_call"
      (let* ((id (alist-get 'toolCallId update))
             (title (alist-get 'title update))
+            (kind (alist-get 'kind update))
             (raw (alist-get 'rawInput update))
             (command (alist-get 'command raw)))
        (agent-shell-bridge-make-message
@@ -119,6 +120,7 @@ UPDATE is the value of (params update) in an ACP session notification."
                       :kind 'tool-call
                       :content (or command title "")
                       :meta (list :tool-call-id id :title title
+                                  :kind kind
                                   :command command
                                   :raw-input raw
                                   :content (alist-get 'content update)))))))
@@ -218,7 +220,10 @@ otherwise sends it once now (non-editing providers buffered it)."
 (defun agent-shell-bridge--feed (message)
   "Dispatch MESSAGE, coalescing consecutive streaming chunks.
 Editing providers get live send-then-edit; non-editing providers get a
-single complete message on flush."
+single complete message on flush.  The core forwards every structured
+message (thinking, each tool call, the answer) to the provider intact --
+collapsing/summarizing is the provider's job, so a rich client can
+consume the full detail while Discord flattens it."
   (let ((role (plist-get message :role))
         (status (plist-get message :status)))
     (cond

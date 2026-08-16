@@ -495,6 +495,12 @@ instance's or session's posts."
    :on-inbound #'agent-shell-bridge-discord--store-inbound
    :on-control #'agent-shell-bridge-discord--store-control
    :set-status (lambda (handle running)
+                 ;; Turn boundary: a new turn resets the activity summary, a
+                 ;; finished turn settles it to past tense.  Runs in the
+                 ;; agent-shell buffer, so its buffer-local state is in scope.
+                 (if running
+                     (agent-shell-bridge-discord--act-reset)
+                   (agent-shell-bridge-discord--act-finalize))
                  (when (stringp handle)
                    (agent-shell-bridge-discord--set-status handle running)))
    :stop #'agent-shell-bridge-discord-gateway--stop))

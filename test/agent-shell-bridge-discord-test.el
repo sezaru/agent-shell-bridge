@@ -1,8 +1,9 @@
 ;;; agent-shell-bridge-discord-test.el --- Discord provider tests -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; ERT tests for the Discord webhook provider: the flattener (truncation,
-;; spoiler collapse, headers) and `send' payload routing (no network).
+;; ERT tests for the Discord webhook provider: the foreground flattener,
+;; the background activity aggregator (verb table + in-place editing), and
+;; `send' payload routing (no network).
 
 ;;; Code:
 
@@ -10,7 +11,7 @@
 (require 'agent-shell-bridge)
 (require 'agent-shell-bridge-discord)
 
-;;;; Flattener
+;;;; Flattener (foreground: agent/user/permission/activity)
 
 (ert-deftest asb-discord-flatten-truncates-to-cap ()
   (let* ((big (make-string 3000 ?x))
@@ -22,15 +23,6 @@
     (should (<= (length out) agent-shell-bridge-discord-max-length))
     (should (string-match-p "truncated" out))))
 
-(ert-deftest asb-discord-flatten-collapses-thinking-in-spoiler ()
-  (let* ((m (agent-shell-bridge-make-message
-             :role 'thinking :status 'complete :collapsible t
-             :parts (list (agent-shell-bridge-make-part
-                           :kind 'text :content "secret plan"))))
-         (out (agent-shell-bridge-discord--flatten m)))
-    (should (string-prefix-p "💭" out))
-    (should (string-match-p "||.*secret plan.*||" out))))
-
 (ert-deftest asb-discord-flatten-short-message-untouched ()
   (let* ((m (agent-shell-bridge-make-message
              :role 'agent :status 'complete
@@ -38,45 +30,6 @@
                            :kind 'text :content "hello world"))))
          (out (agent-shell-bridge-discord--flatten m)))
     (should (equal out "🤖 **Agent**\nhello world"))))
-
-(ert-deftest asb-discord-flatten-tool-short-output-inline ()
-  ;; Small output shows inline in a plain code block (no grey spoiler box).
-  (let ((out (agent-shell-bridge-discord--render
-              (agent-shell-bridge-make-message
-               :role 'tool :status 'success
-               :parts (list (agent-shell-bridge-make-part
-                             :kind 'tool-call :content "line1\nline2"))))))
-    (should (stringp out))
-    (should (string-prefix-p "✅" out))
-    (should (string-match-p "```\nline1\nline2\n```" out))
-    (should-not (string-match-p "||" out))))
-
-(ert-deftest asb-discord-flatten-tool-large-output-attaches ()
-  ;; Large output becomes a file attachment (Discord's compact collapse).
-  (let* ((big (mapconcat #'number-to-string (number-sequence 1 40) "\n"))
-         (out (agent-shell-bridge-discord--render
-               (agent-shell-bridge-make-message
-                :role 'tool :status 'success
-                :parts (list (agent-shell-bridge-make-part
-                              :kind 'tool-call :content big))))))
-    (should (equal (plist-get out :file) "output.txt"))
-    (should (equal (plist-get out :data) big))))
-
-(ert-deftest asb-discord-flatten-tool-empty-success-suppressed ()
-  (should (null (agent-shell-bridge-discord--render
-                 (agent-shell-bridge-make-message
-                  :role 'tool :status 'success
-                  :parts (list (agent-shell-bridge-make-part
-                                :kind 'tool-call :content "")))))))
-
-(ert-deftest asb-discord-flatten-tool-pending-compact-command ()
-  (let ((out (agent-shell-bridge-discord--flatten
-              (agent-shell-bridge-make-message
-               :role 'tool :status 'pending
-               :parts (list (agent-shell-bridge-make-part
-                             :kind 'tool-call :content "rg -n foo\n  bar"))))))
-    (should (string-match-p "`rg -n foo bar`" out))   ; one-lined, not fenced
-    (should-not (string-match-p "||" out))))
 
 (ert-deftest asb-discord-flatten-agent-not-collapsed ()
   (let ((out (agent-shell-bridge-discord--flatten
@@ -87,34 +40,84 @@
     (should-not (string-match-p "||" out))
     (should (string-match-p "the answer" out))))
 
-(ert-deftest asb-discord-flatten-tool-error-shows-output ()
-  ;; A failure keeps its output (inline when small) prefixed with ❌.
-  (let ((err (agent-shell-bridge-discord--render
-              (agent-shell-bridge-make-message
-               :role 'tool :status 'error
-               :parts (list (agent-shell-bridge-make-part
-                             :kind 'tool-call :content "boom\nkaboom"))))))
-    (should (string-prefix-p "❌" err))
-    (should (string-match-p "```\nboom\nkaboom\n```" err))))
-
-(ert-deftest asb-discord-flatten-tool-empty-error-marked ()
-  (should (equal (agent-shell-bridge-discord--render
+(ert-deftest asb-discord-flatten-activity-is-subtext ()
+  (should (equal (agent-shell-bridge-discord--flatten
                   (agent-shell-bridge-make-message
-                   :role 'tool :status 'error
+                   :role 'activity :status 'streaming
                    :parts (list (agent-shell-bridge-make-part
-                                 :kind 'tool-call :content ""))))
-                 "❌ `(failed)`")))
+                                 :kind 'text :content "Thought, ran a command"))))
+                 "-# Thought, ran a command")))
 
-(ert-deftest asb-discord-flatten-thinking-stays-compact ()
-  ;; Long thinking is truncated so the spoiler stays a small bar.
-  (let* ((big (make-string 5000 ?z))
-         (out (agent-shell-bridge-discord--flatten
-               (agent-shell-bridge-make-message
-                :role 'thinking :status 'complete :collapsible t
-                :parts (list (agent-shell-bridge-make-part
-                              :kind 'text :content big))))))
-    (should (<= (length out)
-                (+ 20 agent-shell-bridge-discord-thinking-limit)))))
+(ert-deftest asb-discord-flatten-background-roles-are-nil ()
+  ;; thinking/tool never render as foreground -- they fold into activity.
+  (dolist (role '(thinking tool))
+    (should (null (agent-shell-bridge-discord--flatten
+                   (agent-shell-bridge-make-message
+                    :role role :status 'pending
+                    :parts (list (agent-shell-bridge-make-part
+                                  :kind 'text :content "x"))))))))
+
+;;;; Activity aggregator (verb table + summary)
+
+(defun asb-test--tool-msg (id kind status)
+  (agent-shell-bridge-make-message
+   :role 'tool :status status
+   :parts (list (agent-shell-bridge-make-part
+                 :kind 'tool-call :content ""
+                 :meta (list :tool-call-id id :kind kind)))))
+
+(ert-deftest asb-discord-tool-phrase-mirrors-agent-shell ()
+  (should (equal (agent-shell-bridge-discord--tool-phrase "execute" 1 nil) "ran a command"))
+  (should (equal (agent-shell-bridge-discord--tool-phrase "execute" 2 nil) "ran 2 commands"))
+  (should (equal (agent-shell-bridge-discord--tool-phrase "execute" 1 t) "running a command"))
+  (should (equal (agent-shell-bridge-discord--tool-phrase "read" 2 nil) "read 2 files"))
+  (should (equal (agent-shell-bridge-discord--tool-phrase "edit" 1 nil) "edited a file")))
+
+(ert-deftest asb-discord-activity-summary-thought-then-command ()
+  (with-temp-buffer
+    (let* ((posts nil) (edits nil)
+           (agent-shell-bridge-discord-webhook-url "https://hook")
+           (agent-shell-bridge-discord--post-fn
+            (lambda (_u c) (push c posts) "act-1"))
+           (agent-shell-bridge-discord--edit-fn
+            (lambda (_u c) (push c edits) nil)))
+      ;; thinking -> "Thinking" (first post, sync, gets id)
+      (agent-shell-bridge-discord--act-note-thinking)
+      (should (equal (car posts) "-# Thinking"))
+      ;; a command starts -> edit to present tense
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "t1" "execute" 'pending))
+      (should (equal (car edits) "-# Thought, running a command"))
+      ;; command finishes -> past tense
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "t1" "execute" 'success))
+      (should (equal (car edits) "-# Thought, ran a command"))
+      ;; only one post (the rest are edits of the same message)
+      (should (= (length posts) 1)))))
+
+(ert-deftest asb-discord-activity-counts-multiple-and-groups ()
+  (with-temp-buffer
+    (let* ((last nil)
+           (agent-shell-bridge-discord-webhook-url "https://hook")
+           (agent-shell-bridge-discord--post-fn (lambda (_u c) (setq last c) "id"))
+           (agent-shell-bridge-discord--edit-fn (lambda (_u c) (setq last c) nil)))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "a" "execute" 'pending))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "a" "execute" 'success))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "b" "execute" 'pending))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "b" "execute" 'success))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "c" "read" 'pending))
+      (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "c" "read" 'success))
+      (should (equal last "-# Ran 2 commands, read a file")))))
+
+(ert-deftest asb-discord-activity-finalize-then-reset ()
+  (with-temp-buffer
+    (let ((agent-shell-bridge-discord-webhook-url "https://hook")
+          (agent-shell-bridge-discord--post-fn (lambda (_u _c) "id"))
+          (agent-shell-bridge-discord--edit-fn (lambda (_u _c) nil)))
+      (agent-shell-bridge-discord--act-note-thinking)
+      (should agent-shell-bridge-discord--act-id)
+      (agent-shell-bridge-discord--act-finalize)
+      (should (null agent-shell-bridge-discord--act-id))
+      (should (null agent-shell-bridge-discord--act-thought))
+      (should (null agent-shell-bridge-discord--act-order)))))
 
 ;;;; send routing (no network)
 
@@ -147,34 +150,28 @@
                                    :kind 'text :content "rm -rf /"))))
                    "perm-9"))))
 
-(ert-deftest asb-discord-send-suppressed-message-posts-nothing ()
-  (let* ((posted nil)
-         (agent-shell-bridge-discord-webhook-url "https://hook")
-         (agent-shell-bridge-discord--post-async-fn (lambda (&rest _) (setq posted t)))
-         (agent-shell-bridge-discord--upload-fn (lambda (&rest _) (setq posted t)))
-         (agent-shell-bridge-discord--post-fn (lambda (&rest _) (setq posted t))))
-    ;; an empty finished tool has nothing to show
-    (should (null (agent-shell-bridge-discord--send
-                   (agent-shell-bridge-make-message
-                    :role 'tool :status 'success
-                    :parts (list (agent-shell-bridge-make-part
-                                  :kind 'tool-call :content ""))))))
-    (should (null posted))))
+(ert-deftest asb-discord-send-thinking-folds-into-activity ()
+  ;; A thinking message posts the activity subtext, not a normal message.
+  (with-temp-buffer
+    (let* ((posts nil)
+           (agent-shell-bridge-discord-webhook-url "https://hook")
+           (agent-shell-bridge-discord--post-fn (lambda (_u c) (push c posts) "id"))
+           (agent-shell-bridge-discord--post-async-fn
+            (lambda (&rest _) (error "thinking must not post a normal message"))))
+      (agent-shell-bridge-discord--send
+       (agent-shell-bridge-make-message
+        :role 'thinking :status 'complete
+        :parts (list (agent-shell-bridge-make-part :kind 'text :content "hmm"))))
+      (should (equal posts '("-# Thinking"))))))
 
-(ert-deftest asb-discord-send-large-tool-output-uploads ()
-  (let* ((captured nil)
-         (big (mapconcat #'number-to-string (number-sequence 1 40) "\n"))
-         (agent-shell-bridge-discord-webhook-url "https://hook")
-         (agent-shell-bridge-discord--upload-fn
-          (lambda (url caption name data)
-            (setq captured (list url caption name data)))))
-    (agent-shell-bridge-discord--send
-     (agent-shell-bridge-make-message
-      :role 'tool :status 'success
-      :parts (list (agent-shell-bridge-make-part :kind 'tool-call :content big))))
-    (should (equal (nth 0 captured) "https://hook?wait=true"))
-    (should (equal (nth 2 captured) "output.txt"))
-    (should (equal (nth 3 captured) big))))
+(ert-deftest asb-discord-edit-url-threads-and-targets-message ()
+  (let ((agent-shell-bridge-discord-webhook-url "https://hook"))
+    (should (equal (agent-shell-bridge-discord--edit-url "m-1")
+                   "https://hook/messages/m-1"))
+    (with-temp-buffer
+      (setq-local agent-shell-bridge--session-handle "thread-7")
+      (should (equal (agent-shell-bridge-discord--edit-url "m-1")
+                     "https://hook/messages/m-1?thread_id=thread-7")))))
 
 (ert-deftest asb-discord-send-errors-without-webhook-url ()
   (let ((agent-shell-bridge-discord-webhook-url nil))

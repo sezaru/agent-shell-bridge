@@ -32,12 +32,6 @@ Read from the environment/authinfo; never hard-code a secret here."
   :type '(choice (const nil) string)
   :group 'agent-shell-bridge)
 
-(defcustom agent-shell-bridge-discord-thinking-limit 600
-  "Max chars of thinking shown (collapsed) before it is truncated.
-Keeps the spoiler a small bar instead of a wall of grey."
-  :type 'integer
-  :group 'agent-shell-bridge)
-
 (defcustom agent-shell-bridge-discord-forum-p nil
   "When non-nil, treat the webhook's channel as a forum channel.
 Each session opens one forum post (via `thread_name'); all of its messages
@@ -58,22 +52,15 @@ webhook."
 
 ;;;; Rendering
 
-;; Rendering mirrors agent-shell's collapsed layout so the channel stays
-;; scannable instead of a wall of grey.  The agent's reply and the user's
-;; prompt are shown plainly; a tool call is a single command line.  Its
-;; output is kept -- short output inline in a plain code block, larger
-;; output as a *file attachment* (Discord's one true collapse: a compact
-;; card you click to expand), rather than a giant spoiler box.  Thinking is
-;; one small inline spoiler.  Anything with no signal (an in-progress tool
-;; update, an empty finished one) renders to nil and is not posted.
-;;
-;; `--render' is the entry point: it returns either a content string, an
-;; attachment plist `(:file NAME :data DATA :caption CAP)', or nil.
-;; `--flatten' handles only the string (text) roles and is what the gateway
-;; REST path uses directly.
-
-(defconst agent-shell-bridge-discord--inline-output-max 500
-  "Tool output at or under this many chars/8 lines is shown inline.")
+;; Discord can't collapse/expand, so we mirror agent-shell's *summary*:
+;; the agent's reply and the user's prompt are shown plainly; all the
+;; turn's background work (thinking, running commands, reading/editing
+;; files) folds into ONE small subtext line -- "Thought, ran a command" --
+;; that is edited in place as work happens (see the activity aggregator
+;; below).  This flattening is Discord-specific and lossy on purpose; the
+;; core still forwards the full structured stream, so a richer provider
+;; can consume every thinking chunk and tool call instead of discarding
+;; them.
 
 (defun agent-shell-bridge-discord--header (message)
   "Role header line for MESSAGE (agent/user/permission/system only)."
@@ -83,63 +70,18 @@ webhook."
     ('permission "⚠️ **Permission Required**")
     (_ "ℹ️ **System**")))
 
-(defun agent-shell-bridge-discord--spoiler (s)
-  "Wrap S in a Discord spoiler (collapsed, click to reveal)."
-  (concat "||" s "||"))
-
-(defun agent-shell-bridge-discord--one-line (s)
-  "Collapse whitespace in S to a compact single line."
-  (string-trim (replace-regexp-in-string "[ \t\n]+" " " s)))
-
-(defun agent-shell-bridge-discord--truncate (s limit)
-  "Truncate S to LIMIT chars with an ellipsis."
-  (if (> (length s) limit)
-      (concat (substring s 0 (max 0 limit)) "…")
-    s))
-
-(defun agent-shell-bridge-discord--short-output-p (text)
-  "Non-nil if TEXT is small enough to show inline rather than attach."
-  (and (<= (length text) agent-shell-bridge-discord--inline-output-max)
-       (<= (cl-count ?\n text) 8)))
-
-(defun agent-shell-bridge-discord--tool-render (message)
-  "Render a tool MESSAGE: a string, an attachment plist, or nil.
-Pending shows the command; a finished call shows its output inline (small)
-or as a file attachment (large); in-progress updates are dropped."
-  (let ((status (plist-get message :status))
-        (text (string-trim (agent-shell-bridge-message-text message))))
-    (pcase status
-      ('pending
-       (unless (string-empty-p text)
-         (format "🔧 `%s`" (agent-shell-bridge-discord--one-line text))))
-      ((or 'success 'error 'failed)
-       (let ((mark (if (memq status '(error failed)) "❌" "✅")))
-         (cond
-          ((string-empty-p text)
-           (and (equal mark "❌") "❌ `(failed)`"))
-          ((agent-shell-bridge-discord--short-output-p text)
-           (format "%s\n```\n%s\n```" mark text))
-          (t (list :file (if (equal mark "❌") "error.txt" "output.txt")
-                   :data text :caption mark)))))
-      ;; in-progress tool update: nothing to show yet.
-      (_ nil))))
-
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
-  "Flatten a text-role MESSAGE to a Discord string, or nil.
-Handles agent/user/permission/system (plain, truncated to MAX-LEN) and
-thinking (a compact inline spoiler).  Tool messages are handled by
-`--render'/`--tool-render' instead."
+  "Flatten a foreground MESSAGE (agent/user/permission/system) to a string.
+An `activity' message renders as Discord subtext (small grey).  Thinking
+and tool messages are folded into the activity summary, not flattened
+here, and return nil."
   (let* ((max-len (or max-len agent-shell-bridge-discord-max-length))
          (role (plist-get message :role))
          (text (string-trim (agent-shell-bridge-message-text message))))
     (pcase role
-      ('thinking
-       (unless (string-empty-p text)
-         (concat "💭 "
-                 (agent-shell-bridge-discord--spoiler
-                  (agent-shell-bridge-discord--truncate
-                   text agent-shell-bridge-discord-thinking-limit)))))
-      ('tool (agent-shell-bridge-discord--tool-render message))
+      ((or 'thinking 'tool) nil)
+      ('activity
+       (unless (string-empty-p text) (concat "-# " text)))
       (_
        (let* ((header (agent-shell-bridge-discord--header message))
               (marker agent-shell-bridge-discord--truncation-marker)
@@ -152,8 +94,132 @@ thinking (a compact inline spoiler).  Tool messages are handled by
          (concat header "\n" body))))))
 
 (defalias 'agent-shell-bridge-discord--render #'agent-shell-bridge-discord--flatten
-  "Return the Discord payload for a message: a string, an attachment plist
-`(:file NAME :data DATA :caption CAP)', or nil to suppress.")
+  "Return the Discord content string for a message, or nil to suppress.")
+
+;;;; Activity aggregator (one evolving "Thought, ran a command" subtext)
+
+;; A turn's thinking + tool calls collapse into a single subtext line we
+;; post once and then EDIT in place (webhook messages are editable via
+;; PATCH .../messages/{id}), exactly like agent-shell's collapsed header.
+;; Phrasing is lifted from agent-shell's tool-call-kind table.  Turn
+;; boundaries arrive via `set-status' (t = new turn, nil = turn done).
+
+(defvar agent-shell-bridge-discord--post-fn)   ; defined in Transport, below
+(defvar agent-shell-bridge-discord--edit-fn)
+
+(defconst agent-shell-bridge-discord--tool-phrases
+  '(("execute" . (:past "ran" :present "running" :singular "command" :plural "commands"))
+    ("read"    . (:past "read" :present "reading" :singular "file" :plural "files"))
+    ("edit"    . (:past "edited" :present "editing" :singular "file" :plural "files"))
+    ("delete"  . (:past "deleted" :present "deleting" :singular "file" :plural "files"))
+    ("move"    . (:past "moved" :present "moving" :singular "file" :plural "files"))
+    ("search"  . (:past "ran" :present "running" :singular "search" :plural "searches"))
+    ("fetch"   . (:past "fetched" :present "fetching" :singular "resource" :plural "resources")))
+  "Per-kind phrasing for the activity summary, mirroring agent-shell.")
+
+(defconst agent-shell-bridge-discord--tool-phrase-default
+  '(:past "ran" :present "running" :singular "tool call" :plural "tool calls"))
+
+(defvar-local agent-shell-bridge-discord--act-id nil
+  "Remote id of this turn's activity message, if posted.")
+(defvar-local agent-shell-bridge-discord--act-thought nil)
+(defvar-local agent-shell-bridge-discord--act-thinking nil)
+(defvar-local agent-shell-bridge-discord--act-active nil
+  "Kind string of the tool running right now, or nil.")
+(defvar-local agent-shell-bridge-discord--act-counts nil
+  "Alist of tool-kind string -> count this turn.")
+(defvar-local agent-shell-bridge-discord--act-order nil
+  "Tool kinds in first-seen order this turn.")
+(defvar-local agent-shell-bridge-discord--act-seen nil
+  "Alist of tool-call-id -> kind, to count each tool once.")
+(defvar-local agent-shell-bridge-discord--act-rendered nil
+  "Last summary string sent, to skip no-op edits.")
+
+(defun agent-shell-bridge-discord--tool-phrase (kind count present)
+  "Lowercase phrase for COUNT tools of KIND, present tense when PRESENT."
+  (let ((p (or (assoc-default kind agent-shell-bridge-discord--tool-phrases)
+               agent-shell-bridge-discord--tool-phrase-default)))
+    (format "%s %s %s"
+            (plist-get p (if present :present :past))
+            (if (= count 1) "a" (number-to-string count))
+            (plist-get p (if (= count 1) :singular :plural)))))
+
+(defun agent-shell-bridge-discord--act-summary ()
+  "Assemble this turn's agent-shell-style summary, or nil."
+  (let ((clauses nil))
+    (when agent-shell-bridge-discord--act-thought
+      (push (if agent-shell-bridge-discord--act-thinking "Thinking" "Thought") clauses))
+    (dolist (kind agent-shell-bridge-discord--act-order)
+      (push (agent-shell-bridge-discord--tool-phrase
+             kind (alist-get kind agent-shell-bridge-discord--act-counts 0 nil #'equal)
+             (equal kind agent-shell-bridge-discord--act-active))
+            clauses))
+    (setq clauses (nreverse clauses))
+    (when clauses
+      (let ((first (car clauses)) (rest (mapcar #'downcase (cdr clauses))))
+        (setq first (concat (upcase (substring first 0 1)) (substring first 1)))
+        (mapconcat #'identity (cons first rest) ", ")))))
+
+(defun agent-shell-bridge-discord--act-touch ()
+  "Post or edit this turn's activity subtext if the summary changed."
+  (let ((summary (agent-shell-bridge-discord--act-summary)))
+    (when (and summary (not (equal summary agent-shell-bridge-discord--act-rendered)))
+      (setq agent-shell-bridge-discord--act-rendered summary)
+      (let ((content (concat "-# " summary))
+            (url (agent-shell-bridge-discord--target-url)))
+        (if agent-shell-bridge-discord--act-id
+            (funcall agent-shell-bridge-discord--edit-fn
+                     (agent-shell-bridge-discord--edit-url
+                      agent-shell-bridge-discord--act-id)
+                     content)
+          (setq agent-shell-bridge-discord--act-id
+                (funcall agent-shell-bridge-discord--post-fn url content)))))))
+
+(defun agent-shell-bridge-discord--act-note-thinking ()
+  (setq agent-shell-bridge-discord--act-thought t
+        agent-shell-bridge-discord--act-thinking t
+        agent-shell-bridge-discord--act-active nil)
+  (agent-shell-bridge-discord--act-touch))
+
+(defun agent-shell-bridge-discord--act-note-tool (message)
+  (let* ((meta (plist-get (car (plist-get message :parts)) :meta))
+         (id (plist-get meta :tool-call-id))
+         (kind (or (plist-get meta :kind) "other"))
+         (status (plist-get message :status)))
+    (setq agent-shell-bridge-discord--act-thinking nil)
+    (pcase status
+      ('pending
+       (unless (assoc id agent-shell-bridge-discord--act-seen)
+         (push (cons id kind) agent-shell-bridge-discord--act-seen)
+         (unless (member kind agent-shell-bridge-discord--act-order)
+           (setq agent-shell-bridge-discord--act-order
+                 (append agent-shell-bridge-discord--act-order (list kind))))
+         (cl-incf (alist-get kind agent-shell-bridge-discord--act-counts 0 nil #'equal)))
+       (setq agent-shell-bridge-discord--act-active kind)
+       (agent-shell-bridge-discord--act-touch))
+      ((or 'success 'error)
+       (when (equal agent-shell-bridge-discord--act-active
+                    (cdr (assoc id agent-shell-bridge-discord--act-seen)))
+         (setq agent-shell-bridge-discord--act-active nil)
+         (agent-shell-bridge-discord--act-touch))))))
+
+(defun agent-shell-bridge-discord--act-reset ()
+  "Clear activity state so the next turn starts a fresh summary."
+  (setq agent-shell-bridge-discord--act-id nil
+        agent-shell-bridge-discord--act-thought nil
+        agent-shell-bridge-discord--act-thinking nil
+        agent-shell-bridge-discord--act-active nil
+        agent-shell-bridge-discord--act-counts nil
+        agent-shell-bridge-discord--act-order nil
+        agent-shell-bridge-discord--act-seen nil
+        agent-shell-bridge-discord--act-rendered nil))
+
+(defun agent-shell-bridge-discord--act-finalize ()
+  "Settle the summary to past tense at turn end, then reset."
+  (setq agent-shell-bridge-discord--act-thinking nil
+        agent-shell-bridge-discord--act-active nil)
+  (agent-shell-bridge-discord--act-touch)
+  (agent-shell-bridge-discord--act-reset))
 
 ;;;; Transport
 
@@ -191,26 +257,20 @@ Keeps Emacs responsive -- the mirrored message id is not needed."
   #'agent-shell-bridge-discord--curl-post-async
   "Function of (URL CONTENT) that POSTs without waiting.  Rebound in tests.")
 
-(defun agent-shell-bridge-discord--curl-upload-async (url caption name data)
-  "Fire-and-forget multipart POST attaching DATA as file NAME to URL.
-CAPTION is the message content shown beside the file card.  Returns nil."
-  (let ((tmp (make-temp-file "asb-discord-" nil ".txt" data)))
-    (condition-case _
-        (make-process
-         :name "asb-discord-upload" :noquery t :buffer nil
-         :sentinel (lambda (_p _e) (ignore-errors (delete-file tmp)))
-         :command (list "curl" "-s" "-X" "POST"
-                        "-F" (format "payload_json=%s"
-                                     (json-encode `(("content" . ,(or caption "")))))
-                        "-F" (format "files[0]=@%s;filename=%s;type=text/plain"
-                                     tmp name)
-                        url))
-      (error (ignore-errors (delete-file tmp)))))
+(defun agent-shell-bridge-discord--curl-edit-async (url content)
+  "Fire-and-forget PATCH setting CONTENT on the webhook message at URL."
+  (let ((json (json-encode `(("content" . ,content)))))
+    (ignore-errors
+      (make-process
+       :name "asb-discord-edit" :noquery t :buffer nil :sentinel #'ignore
+       :command (list "curl" "-s" "-X" "PATCH"
+                      "-H" "Content-Type: application/json"
+                      "-d" json url))))
   nil)
 
-(defvar agent-shell-bridge-discord--upload-fn
-  #'agent-shell-bridge-discord--curl-upload-async
-  "Function of (URL CAPTION NAME DATA) uploading a file.  Rebound in tests.")
+(defvar agent-shell-bridge-discord--edit-fn
+  #'agent-shell-bridge-discord--curl-edit-async
+  "Function of (URL CONTENT) that PATCHes a webhook message.  Rebound in tests.")
 
 (defun agent-shell-bridge-discord--with-wait (url)
   "Append the wait=true query param to URL so the POST returns the message."
@@ -230,25 +290,29 @@ CAPTION is the message content shown beside the file card.  Returns nil."
          (format "%s?thread_id=%s" agent-shell-bridge-discord-webhook-url thread)
        agent-shell-bridge-discord-webhook-url))))
 
+(defun agent-shell-bridge-discord--edit-url (id)
+  "The webhook edit URL for message ID, threaded under the forum post."
+  (let ((thread (agent-shell-bridge-discord--session-thread)))
+    (concat agent-shell-bridge-discord-webhook-url "/messages/" id
+            (if thread (format "?thread_id=%s" thread) ""))))
+
 (defun agent-shell-bridge-discord--send (message)
-  "Render MESSAGE and POST it to the configured webhook.
-Renders to nil (not posted), an attachment plist (uploaded as a file
-card, async), or a content string.  Permission strings post synchronously
-\(their id correlates the ✅/❌ reaction); every other string fires async so
-hitting Enter stays snappy.  Threads under the session's forum post."
+  "Handle MESSAGE for the webhook.
+Thinking and tool messages fold into this turn's activity summary (posted
+once, then edited in place); the agent's reply and the user's prompt post
+as normal messages; a permission posts synchronously so its id can
+correlate the ✅/❌ reaction.  Threads under the session's forum post."
   (unless agent-shell-bridge-discord-webhook-url
     (error "agent-shell-bridge-discord-webhook-url is not set"))
-  (when-let* ((payload (agent-shell-bridge-discord--render message)))
-    (let ((url (agent-shell-bridge-discord--target-url)))
-      (pcase payload
-        ((and (pred listp) (guard (plist-get payload :file)))
-         (funcall agent-shell-bridge-discord--upload-fn
-                  url (plist-get payload :caption)
-                  (plist-get payload :file) (plist-get payload :data)))
-        ((pred stringp)
+  (pcase (plist-get message :role)
+    ('thinking (agent-shell-bridge-discord--act-note-thinking) nil)
+    ('tool (agent-shell-bridge-discord--act-note-tool message) nil)
+    (_
+     (when-let* ((content (agent-shell-bridge-discord--render message)))
+       (let ((url (agent-shell-bridge-discord--target-url)))
          (if (eq (plist-get message :role) 'permission)
-             (funcall agent-shell-bridge-discord--post-fn url payload)
-           (funcall agent-shell-bridge-discord--post-async-fn url payload)))))))
+             (funcall agent-shell-bridge-discord--post-fn url content)
+           (funcall agent-shell-bridge-discord--post-async-fn url content)))))))
 
 ;;; Forum: one post per session
 
