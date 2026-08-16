@@ -82,23 +82,45 @@ it survives, yielding one blank line of separation.")
    (when body (list "-d" (json-encode body)))
    (list (concat agent-shell-bridge-discord--api-base path))))
 
+(defun agent-shell-bridge-discord--rest-log-error (method path buffer)
+  "Log a Discord error body (message + code) found in BUFFER, if any.
+For the METHOD PATH request; keeps failed reactions from being silent."
+  (when (buffer-live-p buffer)
+    (let ((resp (ignore-errors
+                  (with-current-buffer buffer
+                    (json-parse-string (buffer-string) :object-type 'alist)))))
+      (when (and (listp resp) (alist-get 'code resp) (alist-get 'message resp))
+        (message "agent-shell-bridge: Discord %s %s failed: %s"
+                 method path (alist-get 'message resp))))))
+
 (defun agent-shell-bridge-discord--rest-request (method path body)
   "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
-Runs synchronously and returns the decoded JSON response, or nil for an
-empty 2xx body (e.g. a 204 from a reaction).  Reactions and status swaps
-go through here: running them synchronously -- and logging any Discord
-error body -- means a failed reaction surfaces instead of being silently
-fire-and-forgotten.  Ordinary message posts do NOT use this; they go
-through `agent-shell-bridge-discord--rest-async' to keep Enter snappy."
-  (let* ((args (agent-shell-bridge-discord--rest-args method path body))
-         (out (with-output-to-string
-                (with-current-buffer standard-output
-                  (apply #'call-process "curl" nil t nil args))))
-         (resp (ignore-errors (json-parse-string out :object-type 'alist))))
-    (when (and (listp resp) (alist-get 'code resp) (alist-get 'message resp))
-      (message "agent-shell-bridge: Discord %s %s failed: %s"
-               method path (alist-get 'message resp)))
-    resp))
+Reactions and status swaps (PUT/DELETE) fire asynchronously so Emacs never
+blocks on them -- but the sentinel inspects the response and logs any
+Discord error, so a failed reaction surfaces instead of being silently
+dropped.  GET/POST/PATCH run synchronously and return the decoded JSON
+response (or nil), since their caller needs the result."
+  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
+    (if (member method '("PUT" "DELETE"))
+        (let ((buf (generate-new-buffer " *asb-discord-rest*")))
+          ;; NB: `:command' must receive the list itself -- never `apply' the
+          ;; args, or curl's flags get parsed as make-process keywords and the
+          ;; request silently never fires (breaking every reaction).
+          (condition-case _
+              (make-process
+               :name "asb-discord-rest" :noquery t :buffer buf
+               :command (cons "curl" args)
+               :sentinel
+               (lambda (proc _event)
+                 (when (memq (process-status proc) '(exit signal))
+                   (agent-shell-bridge-discord--rest-log-error method path buf)
+                   (ignore-errors (kill-buffer buf)))))
+            (error (ignore-errors (kill-buffer buf))))
+          nil)
+      (let ((out (with-output-to-string
+                   (with-current-buffer standard-output
+                     (apply #'call-process "curl" nil t nil args)))))
+        (ignore-errors (json-parse-string out :object-type 'alist))))))
 
 (defvar agent-shell-bridge-discord--rest-fn
   #'agent-shell-bridge-discord--rest-request
