@@ -119,17 +119,24 @@ Ignores the bot's own messages and empty content."
          (is-bot (eq (alist-get 'bot author) t))
          (content (alist-get 'content d))
          (channel (alist-get 'channel_id d))
+         (msg-id (alist-get 'id d))
          (cb (agent-shell-bridge-discord-gateway-on-inbound gw)))
-    (when (and cb content (not (string-empty-p content))
-               (not is-bot)
-               (not (equal author-id
-                           (agent-shell-bridge-discord-gateway-bot-user-id gw))))
-      ;; Live message: the core decides (inject / refuse / command); mark the
-      ;; message per that result so a later cold reconnect won't mistake a
-      ;; handled message for offline backlog.
-      (let ((result (funcall cb (list :text content :session channel))))
-        (agent-shell-bridge-discord--mark-result
-         channel (alist-get 'id d) result)))))
+    (agent-shell-bridge--log
+     "MESSAGE_CREATE: id=%s channel=%s author=%s is-bot=%s bot-user-id=%s cb=%s content=%S"
+     msg-id channel author-id is-bot
+     (agent-shell-bridge-discord-gateway-bot-user-id gw) (and cb t) content)
+    (if (and cb content (not (string-empty-p content))
+             (not is-bot)
+             (not (equal author-id
+                         (agent-shell-bridge-discord-gateway-bot-user-id gw))))
+        ;; Live message: the core decides (inject / refuse / command); mark the
+        ;; message per that result so a later cold reconnect won't mistake a
+        ;; handled message for offline backlog.
+        (let ((result (funcall cb (list :text content :session channel))))
+          (agent-shell-bridge--log "MESSAGE_CREATE: id=%s dispatch result=%S" msg-id result)
+          (agent-shell-bridge-discord--mark-result channel msg-id result))
+      (agent-shell-bridge--log
+       "MESSAGE_CREATE: id=%s SKIPPED (no cb / empty / bot / self)" msg-id))))
 
 (defun agent-shell-bridge-discord--route-reaction (gw d)
   "Route a MESSAGE_REACTION_ADD/REMOVE payload D through GW's control callback."
@@ -171,10 +178,15 @@ Return a keyword describing the event so the live loop can react:
                (agent-shell-bridge-discord-gateway-bot-user-id gw)
                (alist-get 'id (alist-get 'user d))
                (agent-shell-bridge-discord-gateway-resume-url gw)
-               (alist-get 'resume_gateway_url d)))
+               (alist-get 'resume_gateway_url d))
+         (agent-shell-bridge--log
+          "READY: bot-user-id=%s session-id=%s"
+          (agent-shell-bridge-discord-gateway-bot-user-id gw)
+          (agent-shell-bridge-discord-gateway-session-id gw)))
         ("MESSAGE_CREATE"
          (agent-shell-bridge-discord--route-message-create gw d))
         ((or "MESSAGE_REACTION_ADD" "MESSAGE_REACTION_REMOVE")
+         (agent-shell-bridge--log "%s: %S" type d)
          (agent-shell-bridge-discord--route-reaction gw d)))
       :dispatch)
      (t :other))))
@@ -243,6 +255,8 @@ These are the backlog typed while Emacs was offline -- to be rejected."
 
 (defun agent-shell-bridge-discord--mark-result (channel-id message-id result)
   "React to MESSAGE-ID per the dispatch RESULT plist."
+  (agent-shell-bridge--log "mark-result: channel=%s message=%s status=%S"
+                           channel-id message-id (plist-get result :status))
   (pcase (plist-get result :status)
     ('ignore nil)                       ; not our post: leave no trace
     ('consumed (agent-shell-bridge-discord--mark channel-id message-id t))
@@ -264,6 +278,7 @@ These are the backlog typed while Emacs was offline -- to be rejected."
 
 (defun agent-shell-bridge-discord--set-status (thread-id running)
   "Show RUNNING on the forum post THREAD-ID (starter message id == thread id)."
+  (agent-shell-bridge--log "set-status: thread=%s running=%s" thread-id running)
   (let ((on (if running agent-shell-bridge-discord--status-running
               agent-shell-bridge-discord--status-idle))
         (off (if running agent-shell-bridge-discord--status-idle
@@ -278,6 +293,10 @@ consumed and must not be injected into a conversation that moved on."
   (let* ((resp (agent-shell-bridge-discord--rest
                 "GET" (format "/channels/%s/messages?limit=50" channel-id)))
          (stale (agent-shell-bridge-discord--unprocessed-user-messages resp)))
+    (agent-shell-bridge--log
+     "reject-stale: channel=%s fetched=%s stale-ids=%S"
+     channel-id (length (append resp nil))
+     (mapcar (lambda (m) (alist-get 'id m)) stale))
     (dolist (m stale)
       (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
     stale))
@@ -294,6 +313,8 @@ sweep) instead of silently lingering unacknowledged."
   "Reject unprocessed backlog in this instance's OWN posts only.
 Restricted to owned threads so a shared bot never touches another
 instance's or session's posts."
+  (agent-shell-bridge--log "sweep-forum: owned threads=%S"
+                           (hash-table-keys agent-shell-bridge--session->buffer))
   (dolist (thread (hash-table-keys agent-shell-bridge--session->buffer))
     (when (stringp thread)
       (ignore-errors (agent-shell-bridge-discord--reject-stale thread)))))
@@ -336,6 +357,8 @@ instance's or session's posts."
                  (json-parse-string (websocket-frame-text frame)
                                     :object-type 'alist))))
     (when event
+      (agent-shell-bridge--log "gw frame: op=%s type=%s"
+                               (alist-get 'op event) (alist-get 't event))
       (pcase (agent-shell-bridge-discord--on-gateway-event gw event)
         (:hello
          (agent-shell-bridge-discord--start-heartbeat gw)

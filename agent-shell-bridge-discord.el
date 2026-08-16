@@ -100,27 +100,41 @@ blocks on them -- but the sentinel inspects the response and logs any
 Discord error, so a failed reaction surfaces instead of being silently
 dropped.  GET/POST/PATCH run synchronously and return the decoded JSON
 response (or nil), since their caller needs the result."
+  (agent-shell-bridge--log "rest: %s %s%s" method path
+                           (if (member method '("PUT" "DELETE")) " (async)" ""))
   (let ((args (agent-shell-bridge-discord--rest-args method path body)))
     (if (member method '("PUT" "DELETE"))
         (let ((buf (generate-new-buffer " *asb-discord-rest*")))
           ;; NB: `:command' must receive the list itself -- never `apply' the
           ;; args, or curl's flags get parsed as make-process keywords and the
           ;; request silently never fires (breaking every reaction).
-          (condition-case _
+          (condition-case err
               (make-process
                :name "asb-discord-rest" :noquery t :buffer buf
                :command (cons "curl" args)
                :sentinel
-               (lambda (proc _event)
+               (lambda (proc event)
                  (when (memq (process-status proc) '(exit signal))
+                   (agent-shell-bridge--log
+                    "rest: %s %s -> exit=%s body=%S" method path
+                    (string-trim event)
+                    (with-current-buffer buf
+                      (let ((s (buffer-string)))
+                        (substring s 0 (min 200 (length s))))))
                    (agent-shell-bridge-discord--rest-log-error method path buf)
                    (ignore-errors (kill-buffer buf)))))
-            (error (ignore-errors (kill-buffer buf))))
+            (error
+             (agent-shell-bridge--log "rest: %s %s make-process FAILED: %S"
+                                      method path err)
+             (ignore-errors (kill-buffer buf))))
           nil)
-      (let ((out (with-output-to-string
-                   (with-current-buffer standard-output
-                     (apply #'call-process "curl" nil t nil args)))))
-        (ignore-errors (json-parse-string out :object-type 'alist))))))
+      (let* ((out (with-output-to-string
+                    (with-current-buffer standard-output
+                      (apply #'call-process "curl" nil t nil args))))
+             (resp (ignore-errors (json-parse-string out :object-type 'alist))))
+        (agent-shell-bridge--log "rest: %s %s -> body=%S" method path
+                                 (substring out 0 (min 200 (length out))))
+        resp))))
 
 (defvar agent-shell-bridge-discord--rest-fn
   #'agent-shell-bridge-discord--rest-request
@@ -146,6 +160,8 @@ response we do not need back."
 
 (defun agent-shell-bridge-discord--react (channel-id message-id emoji)
   "Add EMOJI as the bot's reaction to MESSAGE-ID in CHANNEL-ID."
+  (agent-shell-bridge--log "react: %s on channel=%s message=%s"
+                           emoji channel-id message-id)
   (agent-shell-bridge-discord--rest
    "PUT"
    (format "/channels/%s/messages/%s/reactions/%s/@me"
@@ -426,6 +442,9 @@ agent reply, user prompt and command replies post as normal messages.
 Posts under the session's forum post when one exists."
   (unless agent-shell-bridge-discord-bot-token
     (error "agent-shell-bridge-discord-bot-token is not set"))
+  (agent-shell-bridge--log "send: role=%s thread=%s"
+                           (plist-get message :role)
+                           (agent-shell-bridge-discord--post-channel))
   (pcase (plist-get message :role)
     ('thinking (agent-shell-bridge-discord--act-note-thinking) nil)
     ('tool (agent-shell-bridge-discord--act-note-tool message) nil)

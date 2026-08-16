@@ -27,9 +27,27 @@
 
 (require 'cl-lib)
 (require 'map)
+(require 'subr-x)
 (require 'agent-shell-bridge-provider)
 
 (declare-function agent-shell--state "agent-shell")
+
+;;;; Trace logging
+
+(defcustom agent-shell-bridge-debug t
+  "When non-nil, write verbose trace lines to `*agent-shell-bridge-log*'.
+A debugging aid for the inbound/reaction path; turn off once stable."
+  :type 'boolean
+  :group 'agent-shell-bridge)
+
+(defun agent-shell-bridge--log (fmt &rest args)
+  "Append a timestamped trace line (FMT ARGS) to the log buffer."
+  (when agent-shell-bridge-debug
+    (let ((line (concat (format-time-string "%H:%M:%S.%3N ")
+                        (ignore-errors (apply #'format fmt args)))))
+      (with-current-buffer (get-buffer-create "*agent-shell-bridge-log*")
+        (goto-char (point-max))
+        (insert line "\n")))))
 
 ;;;; Structured message model
 
@@ -330,8 +348,12 @@ new one."
                        (funcall (agent-shell-bridge-provider-start-session provider)
                                 (list :name (buffer-name) :title title)))))
       (setq agent-shell-bridge--session-handle handle)
+      (agent-shell-bridge--log
+       "ensure-session: session-id=%S existing=%S handle=%S" session-id existing handle)
       (when handle
         (puthash handle (current-buffer) agent-shell-bridge--session->buffer)
+        (agent-shell-bridge--log "ensure-session: registered handle=%S -> %S"
+                                 handle (current-buffer))
         (when (and session-id (not existing))
           (agent-shell-bridge--save-handle session-id handle))))))
 
@@ -350,15 +372,23 @@ available after a resume, so the caller can retry."
       t
     (let ((session-id (agent-shell-bridge--session-id)))
       (cond
-       ((null session-id) nil)          ; resume handshake not finished yet
+       ((null session-id)
+        (agent-shell-bridge--log "relink: session-id not ready yet, will retry")
+        nil)                            ; resume handshake not finished yet
        ((agent-shell-bridge--load-handle session-id)
         (let ((handle (agent-shell-bridge--load-handle session-id)))
           (setq agent-shell-bridge--session-started t
                 agent-shell-bridge--session-handle handle)
           (puthash handle (current-buffer) agent-shell-bridge--session->buffer)
+          (agent-shell-bridge--log
+           "relink: RESOLVED session-id=%S -> handle=%S, running relink hooks"
+           session-id handle)
           (run-hook-with-args 'agent-shell-bridge--relink-functions handle)
           t))
-       (t t)))))                        ; known session, no saved post => new
+       (t
+        (agent-shell-bridge--log
+         "relink: session-id=%S known but no saved post (new session)" session-id)
+        t)))))                          ; known session, no saved post => new
 
 (defun agent-shell-bridge--relink-session (&optional attempts)
   "Try to relink this buffer; retry for a while as the session id appears."
@@ -567,17 +597,24 @@ idle and refuses when busy (it never queues)."
          (session (plist-get event :session))
          (buffer (agent-shell-bridge--buffer-for-session session))
          (cmd (agent-shell-bridge--parse-command text)))
+    (agent-shell-bridge--log
+     "dispatch: session=%S text=%S buffer=%S cmd=%S owned-sessions=%S"
+     session text buffer (car cmd)
+     (hash-table-keys agent-shell-bridge--session->buffer))
     (cond
      ;; Not one of this instance's posts -> ignore silently (no reaction).
      ((not (buffer-live-p buffer))
+      (agent-shell-bridge--log "dispatch: -> IGNORE (no owned buffer for %S)" session)
       (list :status 'ignore))
      (cmd
+      (agent-shell-bridge--log "dispatch: -> COMMAND %s" (car cmd))
       (ignore-errors
         (funcall (cdr (assoc (car cmd) agent-shell-bridge-command-table))
                  (cdr cmd) buffer))
       (list :status 'command
             :action (if (member (car cmd) '("/interrupt" "/stop")) 'interrupt 'command)))
      ((agent-shell-bridge--buffer-busy-p buffer)
+      (agent-shell-bridge--log "dispatch: -> REFUSED (busy)")
       (list :status 'refused :reason 'busy))
      (t
       ;; Inject must never throw past here: a live message that fails to
@@ -586,8 +623,10 @@ idle and refuses when busy (it never queues)."
       ;; and rejects it.
       (condition-case err
           (progn (agent-shell-bridge-inject text buffer)
+                 (agent-shell-bridge--log "dispatch: -> CONSUMED (injected)")
                  (list :status 'consumed))
         (error
+         (agent-shell-bridge--log "dispatch: -> REFUSED (inject threw: %S)" err)
          (message "agent-shell-bridge: inject failed: %S" err)
          (list :status 'refused)))))))
 
