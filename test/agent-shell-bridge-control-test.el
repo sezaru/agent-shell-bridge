@@ -80,5 +80,58 @@
         (remhash "sess-x" agent-shell-bridge--session->buffer)))
     (should (equal injected "hello agent"))))
 
+;;;; Inbound commands + busy-refuse
+
+(ert-deftest asb-inbound-command-parses-interrupt ()
+  (should (eq (agent-shell-bridge--inbound-command "/interrupt") 'interrupt))
+  (should (eq (agent-shell-bridge--inbound-command "  /STOP ") 'interrupt))
+  (should (null (agent-shell-bridge--inbound-command "hello there")))
+  (should (null (agent-shell-bridge--inbound-command nil))))
+
+(ert-deftest asb-dispatch-inbound-command-interrupts-not-injects ()
+  (let ((interrupted 0) (injected nil))
+    (with-temp-buffer
+      (setq-local agent-shell-bridge-mode t)
+      (cl-letf (((symbol-function 'agent-shell-interrupt)
+                 (lambda (&rest _) (cl-incf interrupted)))
+                ((symbol-function 'agent-shell-bridge-inject)
+                 (lambda (&rest _) (setq injected t))))
+        (let ((res (agent-shell-bridge--dispatch-inbound
+                    (list :text "/interrupt" :session nil))))
+          (should (eq (plist-get res :status) 'command))
+          (should (= interrupted 1))
+          (should (null injected)))))))
+
+(ert-deftest asb-dispatch-inbound-refuses-when-busy ()
+  (let ((injected nil))
+    (with-temp-buffer
+      (let ((buf (current-buffer)))
+        (puthash "s" buf agent-shell-bridge--session->buffer)
+        (cl-letf (((symbol-function 'agent-shell-bridge--buffer-busy-p)
+                   (lambda (_b) t))
+                  ((symbol-function 'agent-shell-bridge-inject)
+                   (lambda (&rest _) (setq injected t))))
+          (let ((res (agent-shell-bridge--dispatch-inbound
+                      (list :text "do X" :session "s"))))
+            (should (eq (plist-get res :status) 'refused))
+            (should (eq (plist-get res :reason) 'busy))
+            (should (null injected))))
+        (remhash "s" agent-shell-bridge--session->buffer)))))
+
+(ert-deftest asb-dispatch-inbound-consumes-when-idle ()
+  (let ((injected nil))
+    (with-temp-buffer
+      (let ((buf (current-buffer)))
+        (puthash "s" buf agent-shell-bridge--session->buffer)
+        (cl-letf (((symbol-function 'agent-shell-bridge--buffer-busy-p)
+                   (lambda (_b) nil))
+                  ((symbol-function 'agent-shell-bridge-inject)
+                   (lambda (text &optional _b) (setq injected text))))
+          (let ((res (agent-shell-bridge--dispatch-inbound
+                      (list :text "do X" :session "s"))))
+            (should (eq (plist-get res :status) 'consumed))
+            (should (equal injected "do X"))))
+        (remhash "s" agent-shell-bridge--session->buffer)))))
+
 (provide 'agent-shell-bridge-control-test)
 ;;; agent-shell-bridge-control-test.el ends here

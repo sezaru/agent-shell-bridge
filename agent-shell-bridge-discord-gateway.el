@@ -127,10 +127,12 @@ Ignores the bot's own messages and empty content."
                (not is-bot)
                (not (equal author-id
                            (agent-shell-bridge-discord-gateway-bot-user-id gw))))
-      ;; Live message: consume it and mark it ✅ so a later cold reconnect
-      ;; won't mistake it for offline backlog.
-      (funcall cb (list :text content :session channel))
-      (agent-shell-bridge-discord--mark channel (alist-get 'id d) t))))
+      ;; Live message: the core decides (inject / refuse / command); mark the
+      ;; message per that result so a later cold reconnect won't mistake a
+      ;; handled message for offline backlog.
+      (let ((result (funcall cb (list :text content :session channel))))
+        (agent-shell-bridge-discord--mark-result
+         channel (alist-get 'id d) result)))))
 
 (defun agent-shell-bridge-discord--route-reaction (gw d)
   "Route a MESSAGE_REACTION_ADD/REMOVE payload D through GW's control callback."
@@ -261,6 +263,45 @@ These are the backlog typed while Emacs was offline -- to be rejected."
      (and (not (eq (alist-get 'bot (alist-get 'author m)) t))
           (not (agent-shell-bridge-discord--bot-marked-p m))))
    (append messages nil)))
+
+(defconst agent-shell-bridge-discord--command-mark "🛑")
+
+(defconst agent-shell-bridge-discord--reason-emoji
+  '((busy . "⏳") (offline . "💤") (no-session . "❓"))
+  "Maps a refusal reason to the emoji added alongside ❌.")
+
+(defun agent-shell-bridge-discord--unreact (channel-id message-id emoji)
+  "Remove the bot's EMOJI reaction from MESSAGE-ID in CHANNEL-ID."
+  (agent-shell-bridge-discord--rest
+   "DELETE"
+   (format "/channels/%s/messages/%s/reactions/%s/@me"
+           channel-id message-id (url-hexify-string emoji))))
+
+(defun agent-shell-bridge-discord--mark-result (channel-id message-id result)
+  "React to MESSAGE-ID per the dispatch RESULT plist."
+  (pcase (plist-get result :status)
+    ('consumed (agent-shell-bridge-discord--mark channel-id message-id t))
+    ('command (agent-shell-bridge-discord--react
+               channel-id message-id agent-shell-bridge-discord--command-mark))
+    ('refused
+     (agent-shell-bridge-discord--mark channel-id message-id nil)
+     (when-let* ((e (alist-get (plist-get result :reason)
+                               agent-shell-bridge-discord--reason-emoji)))
+       (agent-shell-bridge-discord--react channel-id message-id e)))))
+
+;;;; Per-session running indicator (🟢 running / 💤 idle on the post)
+
+(defconst agent-shell-bridge-discord--status-running "🟢")
+(defconst agent-shell-bridge-discord--status-idle "💤")
+
+(defun agent-shell-bridge-discord--set-status (thread-id running)
+  "Show RUNNING on the forum post THREAD-ID (starter message id == thread id)."
+  (let ((on (if running agent-shell-bridge-discord--status-running
+              agent-shell-bridge-discord--status-idle))
+        (off (if running agent-shell-bridge-discord--status-idle
+               agent-shell-bridge-discord--status-running)))
+    (agent-shell-bridge-discord--unreact thread-id thread-id off)
+    (agent-shell-bridge-discord--react thread-id thread-id on)))
 
 (defun agent-shell-bridge-discord--reject-stale (channel-id)
   "Reject (❌) every unprocessed user message in CHANNEL-ID; return them.

@@ -293,12 +293,43 @@ control for that).  Submitted without stealing focus."
         (when (fboundp 'shell-maker-submit)
           (call-interactively #'shell-maker-submit)))))))
 
+(defcustom agent-shell-bridge-commands
+  '(("/interrupt" . interrupt)
+    ("/stop" . interrupt))
+  "Alist mapping an inbound command message to a control action."
+  :type '(alist :key-type string :value-type symbol)
+  :group 'agent-shell-bridge)
+
+(defun agent-shell-bridge--inbound-command (text)
+  "Return the control action if TEXT is a command message, else nil."
+  (and text (cdr (assoc (string-trim (downcase text))
+                        agent-shell-bridge-commands))))
+
+(defun agent-shell-bridge--buffer-busy-p (buffer)
+  "Non-nil if BUFFER's agent is mid-turn."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (fboundp 'shell-maker-busy) (shell-maker-busy)))))
+
 (defun agent-shell-bridge--dispatch-inbound (event)
-  "Handle an inbound EVENT (:text :session) by injecting into its buffer."
-  (let ((buffer (agent-shell-bridge--buffer-for-session
-                 (plist-get event :session))))
-    (when (buffer-live-p buffer)
-      (agent-shell-bridge-inject (plist-get event :text) buffer))))
+  "Handle an inbound EVENT (:text :session); return a result plist.
+Result `:status' is `command', `consumed' or `refused' (with a `:reason'
+of `busy' or `no-session').  A busy agent refuses -- it never queues."
+  (let* ((text (plist-get event :text))
+         (session (plist-get event :session))
+         (buffer (agent-shell-bridge--buffer-for-session session))
+         (cmd (agent-shell-bridge--inbound-command text)))
+    (cond
+     (cmd
+      (agent-shell-bridge-handle-control (list :action cmd :session session))
+      (list :status 'command :action cmd))
+     ((not (buffer-live-p buffer))
+      (list :status 'refused :reason 'no-session))
+     ((agent-shell-bridge--buffer-busy-p buffer)
+      (list :status 'refused :reason 'busy))
+     (t
+      (agent-shell-bridge-inject text buffer)
+      (list :status 'consumed)))))
 
 ;;; Permission requests mirrored to the remote await a control action.
 

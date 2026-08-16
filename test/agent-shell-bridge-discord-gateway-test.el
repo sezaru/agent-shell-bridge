@@ -180,13 +180,13 @@
     (should (= (length puts) 2))
     (should (seq-every-p (lambda (p) (string-match-p (url-hexify-string "❌") p)) puts))))
 
-(ert-deftest asb-gw-live-message-gets-consumed-mark ()
+(ert-deftest asb-gw-live-message-consumed-gets-check ()
   (let* ((puts nil) (injected nil)
          (agent-shell-bridge-discord--rest-fn
           (lambda (method path _b) (when (equal method "PUT") (push path puts)) nil))
          (gw (agent-shell-bridge-discord-gateway-create
               :bot-user-id "bot-99"
-              :on-inbound (lambda (ev) (setq injected ev)))))
+              :on-inbound (lambda (ev) (setq injected ev) (list :status 'consumed)))))
     (agent-shell-bridge-discord--on-gateway-event
      gw '((op . 0) (t . "MESSAGE_CREATE")
           (d . ((id . "m-7") (content . "do it")
@@ -195,6 +195,44 @@
     (should (= (length puts) 1))
     (should (string-match-p "/messages/m-7/reactions/" (car puts)))
     (should (string-match-p (url-hexify-string "✅") (car puts)))))
+
+(ert-deftest asb-gw-refused-busy-gets-x-plus-hourglass ()
+  (let* ((puts nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path _b) (when (equal method "PUT") (push path puts)) nil))
+         (gw (agent-shell-bridge-discord-gateway-create
+              :bot-user-id "bot-99"
+              :on-inbound (lambda (_ev) (list :status 'refused :reason 'busy)))))
+    (agent-shell-bridge-discord--on-gateway-event
+     gw '((op . 0) (t . "MESSAGE_CREATE")
+          (d . ((id . "m-8") (content . "later") (channel_id . "c")
+                (author . ((id . "u1")))))))
+    (should (= (length puts) 2))
+    (should (seq-some (lambda (p) (string-match-p (url-hexify-string "❌") p)) puts))
+    (should (seq-some (lambda (p) (string-match-p (url-hexify-string "⏳") p)) puts))))
+
+(ert-deftest asb-gw-command-gets-stop-mark ()
+  (let ((res (agent-shell-bridge-discord--mark-result
+              "c" "m" '(:status command :action interrupt)))
+        (puts nil))
+    (ignore res)
+    (let ((agent-shell-bridge-discord--rest-fn
+           (lambda (_m p _b) (push p puts) nil)))
+      (agent-shell-bridge-discord--mark-result "c" "m" '(:status command))
+      (should (string-match-p (url-hexify-string "🛑") (car puts))))))
+
+(ert-deftest asb-gw-set-status-running-swaps-reactions ()
+  (let* ((calls nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path _b) (push (list method path) calls) nil)))
+    (agent-shell-bridge-discord--set-status "thread-1" t)
+    (setq calls (reverse calls))
+    ;; first removes 💤, then adds 🟢, both targeting the starter (== thread id)
+    (should (equal (nth 0 (nth 0 calls)) "DELETE"))
+    (should (string-match-p (url-hexify-string "💤") (nth 1 (nth 0 calls))))
+    (should (equal (nth 0 (nth 1 calls)) "PUT"))
+    (should (string-match-p (url-hexify-string "🟢") (nth 1 (nth 1 calls))))
+    (should (string-match-p "/messages/thread-1/" (nth 1 (nth 1 calls))))))
 
 (provide 'agent-shell-bridge-discord-gateway-test)
 ;;; agent-shell-bridge-discord-gateway-test.el ends here
