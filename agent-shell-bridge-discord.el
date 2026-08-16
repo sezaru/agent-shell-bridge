@@ -50,6 +50,15 @@ webhook."
 (defconst agent-shell-bridge-discord--body-overhead 40
   "Chars reserved for header, spoiler/code wrappers, marker and newlines.")
 
+(defconst agent-shell-bridge-discord--separator "\n​"
+  "Appended to each posted message so consecutive messages read apart.
+A bare trailing newline is trimmed by Discord; the zero-width space after
+it survives, yielding one blank line of separation.")
+
+(defun agent-shell-bridge-discord--separated (content)
+  "CONTENT with the trailing blank-line separator appended."
+  (concat content agent-shell-bridge-discord--separator))
+
 ;;;; Rendering
 
 ;; Discord can't collapse/expand, so we mirror agent-shell's *summary*:
@@ -169,7 +178,7 @@ here, and return nil."
   (let ((summary (agent-shell-bridge-discord--act-summary)))
     (when (and summary (not (equal summary agent-shell-bridge-discord--act-rendered)))
       (setq agent-shell-bridge-discord--act-rendered summary)
-      (let ((content (concat "-# " summary))
+      (let ((content (agent-shell-bridge-discord--separated (concat "-# " summary)))
             (url (agent-shell-bridge-discord--target-url)))
         (if agent-shell-bridge-discord--act-id
             (funcall agent-shell-bridge-discord--edit-fn
@@ -348,7 +357,8 @@ Threads under the session's forum post."
          (funcall agent-shell-bridge-discord--upload-fn
                   (agent-shell-bridge-discord--target-url) (car file) (cdr file))
        (when-let* ((content (agent-shell-bridge-discord--render message)))
-         (let ((url (agent-shell-bridge-discord--target-url)))
+         (let ((url (agent-shell-bridge-discord--target-url))
+               (content (agent-shell-bridge-discord--separated content)))
            (if (eq (plist-get message :role) 'permission)
                (agent-shell-bridge-discord--post-permission url content)
              (funcall agent-shell-bridge-discord--post-async-fn url content))))))))

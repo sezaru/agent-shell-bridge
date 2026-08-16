@@ -83,13 +83,13 @@
             (lambda (_u c) (push c edits) nil)))
       ;; thinking -> "Thinking" (first post, sync, gets id)
       (agent-shell-bridge-discord--act-note-thinking)
-      (should (equal (car posts) "-# Thinking"))
+      (should (string-prefix-p "-# Thinking" (car posts)))
       ;; a command starts -> edit to present tense
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "t1" "execute" 'pending))
-      (should (equal (car edits) "-# Thought, running a command"))
+      (should (string-prefix-p "-# Thought, running a command" (car edits)))
       ;; command finishes -> past tense
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "t1" "execute" 'success))
-      (should (equal (car edits) "-# Thought, ran a command"))
+      (should (string-prefix-p "-# Thought, ran a command" (car edits)))
       ;; only one post (the rest are edits of the same message)
       (should (= (length posts) 1)))))
 
@@ -105,7 +105,7 @@
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "b" "execute" 'success))
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "c" "read" 'pending))
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "c" "read" 'success))
-      (should (equal last "-# Ran 2 commands, read a file")))))
+      (should (string-prefix-p "-# Ran 2 commands, read a file" last)))))
 
 (ert-deftest asb-discord-activity-finalize-then-reset ()
   (with-temp-buffer
@@ -135,7 +135,9 @@
       :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
     (should (null sync-called))
     (should (equal (nth 0 captured) "https://example.test/hook?wait=true"))
-    (should (equal (nth 1 captured) "🤖 **Agent**\nhi"))))
+    (should (string-prefix-p "🤖 **Agent**\nhi" (nth 1 captured)))
+    ;; each message ends with the blank-line separator
+    (should (string-suffix-p agent-shell-bridge-discord--separator (nth 1 captured)))))
 
 (ert-deftest asb-discord-send-permission-is-sync-with-id ()
   ;; Permission posts synchronously and returns its id (for reaction correlation).
@@ -162,7 +164,8 @@
        (agent-shell-bridge-make-message
         :role 'thinking :status 'complete
         :parts (list (agent-shell-bridge-make-part :kind 'text :content "hmm"))))
-      (should (equal posts '("-# Thinking"))))))
+      (should (= (length posts) 1))
+      (should (string-prefix-p "-# Thinking" (car posts))))))
 
 (ert-deftest asb-discord-send-file-part-uploads ()
   ;; A message carrying a file part (e.g. /transcript) uploads as an attachment.
