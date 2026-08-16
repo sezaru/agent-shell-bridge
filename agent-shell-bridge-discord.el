@@ -32,6 +32,15 @@ Read from the environment/authinfo; never hard-code a secret here."
   :type '(choice (const nil) string)
   :group 'agent-shell-bridge)
 
+(defcustom agent-shell-bridge-discord-forum-p nil
+  "When non-nil, treat the webhook's channel as a forum channel.
+Each session opens one forum post (via `thread_name'); all of its messages
+thread under that post via `?thread_id='.  Requires the webhook to live on
+a forum/media channel -- a plain text channel cannot create threads from a
+webhook."
+  :type 'boolean
+  :group 'agent-shell-bridge)
+
 (defconst agent-shell-bridge-discord-max-length 2000
   "Discord's per-message character cap.")
 
@@ -123,21 +132,67 @@ truncated with a marker."
   #'agent-shell-bridge-discord--curl-post
   "Function of (URL CONTENT) that performs the POST.  Rebound in tests.")
 
+(defun agent-shell-bridge-discord--session-thread ()
+  "The current buffer's forum thread id, if any."
+  (let ((h (and (boundp 'agent-shell-bridge--session-handle)
+                agent-shell-bridge--session-handle)))
+    (and (stringp h) h)))
+
 (defun agent-shell-bridge-discord--send (message)
-  "Flatten MESSAGE and POST it to the configured webhook.  Returns nil."
+  "Flatten MESSAGE and POST it to the configured webhook.  Returns nil.
+When the session opened a forum post, thread the message under it."
   (unless agent-shell-bridge-discord-webhook-url
     (error "agent-shell-bridge-discord-webhook-url is not set"))
-  (funcall agent-shell-bridge-discord--post-fn
-           agent-shell-bridge-discord-webhook-url
-           (agent-shell-bridge-discord--flatten message))
+  (let* ((thread (agent-shell-bridge-discord--session-thread))
+         (url (if thread
+                  (format "%s?thread_id=%s"
+                          agent-shell-bridge-discord-webhook-url thread)
+                agent-shell-bridge-discord-webhook-url)))
+    (funcall agent-shell-bridge-discord--post-fn
+             url (agent-shell-bridge-discord--flatten message)))
   nil)
+
+;;; Forum: one post per session
+
+(defun agent-shell-bridge-discord--curl-create (url json)
+  "POST JSON to URL and return the response body string."
+  (with-output-to-string
+    (with-current-buffer standard-output
+      (call-process "curl" nil t nil
+                    "-s" "-X" "POST"
+                    "-H" "Content-Type: application/json"
+                    "-d" json url))))
+
+(defvar agent-shell-bridge-discord--create-fn
+  #'agent-shell-bridge-discord--curl-create
+  "Function of (URL JSON) returning the response body.  Rebound in tests.")
+
+(defun agent-shell-bridge-discord--create-post (title)
+  "Create a forum post titled TITLE; return its thread id, or nil on failure."
+  (let* ((url (concat agent-shell-bridge-discord-webhook-url "?wait=true"))
+         (name (substring title 0 (min (length title) 100)))
+         (json (json-encode `(("thread_name" . ,name)
+                              ("content" . "🧵 Session started"))))
+         (resp (funcall agent-shell-bridge-discord--create-fn url json))
+         (data (ignore-errors (json-parse-string resp :object-type 'alist))))
+    ;; The forum starter message's channel_id is the new thread id.
+    (or (alist-get 'channel_id data) (alist-get 'id data))))
+
+(defun agent-shell-bridge-discord--start-session (meta)
+  "Open a forum post per session when forum mode is on; else a flat handle."
+  (if agent-shell-bridge-discord-forum-p
+      (or (agent-shell-bridge-discord--create-post
+           (or (plist-get meta :name) "agent-shell session"))
+          (progn (message "agent-shell-bridge: forum post creation failed")
+                 'discord-webhook))
+    'discord-webhook))
 
 (defun agent-shell-bridge-discord-webhook-provider ()
   "Return the read-only Discord webhook provider."
   (agent-shell-bridge-provider-create
    :name 'discord-webhook
    :can-edit nil                        ; a webhook cannot edit; buffer + send once
-   :start-session (lambda (_meta) 'discord-webhook)
+   :start-session #'agent-shell-bridge-discord--start-session
    :send #'agent-shell-bridge-discord--send
    :edit #'ignore
    :delete #'ignore

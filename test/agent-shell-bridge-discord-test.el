@@ -83,6 +83,64 @@
        :role 'agent :status 'complete
        :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi")))))))
 
+;;;; Forum: per-session posts
+
+(ert-deftest asb-discord-create-post-uses-thread-name-and-returns-id ()
+  (let* ((captured nil)
+         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--create-fn
+          (lambda (url json)
+            (setq captured (list url json))
+            "{\"id\":\"msg-1\",\"channel_id\":\"thread-1\"}")))
+    (let ((id (agent-shell-bridge-discord--create-post "Refactor the parser")))
+      (should (equal id "thread-1"))
+      (should (string-match-p "wait=true" (nth 0 captured)))
+      (should (string-match-p "thread_name" (nth 1 captured)))
+      (should (string-match-p "Refactor the parser" (nth 1 captured))))))
+
+(ert-deftest asb-discord-create-post-truncates-title-to-100 ()
+  (let* ((agent-shell-bridge-discord-webhook-url "https://hook")
+         (long (make-string 250 ?a))
+         (seen nil)
+         (agent-shell-bridge-discord--create-fn
+          (lambda (_url json) (setq seen json) "{\"channel_id\":\"t\"}")))
+    (agent-shell-bridge-discord--create-post long)
+    (let ((name (alist-get 'thread_name
+                           (json-parse-string
+                            (progn (string-match "{.*}" seen) (match-string 0 seen))
+                            :object-type 'alist))))
+      (should (<= (length name) 100)))))
+
+(ert-deftest asb-discord-send-threads-under-session-post ()
+  (let* ((url nil)
+         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--post-fn
+          (lambda (u _content) (setq url u))))
+    (with-temp-buffer
+      (setq-local agent-shell-bridge--session-handle "thread-9")
+      (agent-shell-bridge-discord--send
+       (agent-shell-bridge-make-message
+        :role 'agent :status 'complete
+        :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi")))))
+    (should (equal url "https://hook?thread_id=thread-9"))))
+
+(ert-deftest asb-discord-send-flat-without-session-handle ()
+  (let* ((url nil)
+         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--post-fn
+          (lambda (u _content) (setq url u))))
+    ;; no session handle bound -> post to channel root
+    (agent-shell-bridge-discord--send
+     (agent-shell-bridge-make-message
+      :role 'agent :status 'complete
+      :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
+    (should (equal url "https://hook"))))
+
+(ert-deftest asb-discord-start-session-flat-when-not-forum ()
+  (let ((agent-shell-bridge-discord-forum-p nil))
+    (should (eq (agent-shell-bridge-discord--start-session '(:name "x"))
+                'discord-webhook))))
+
 (ert-deftest asb-discord-provider-registers-and-activates ()
   (agent-shell-bridge-discord-webhook-register)
   (should (eq (agent-shell-bridge-provider-name
