@@ -136,6 +136,7 @@ truncated with a marker."
   "Return the read-only Discord webhook provider."
   (agent-shell-bridge-provider-create
    :name 'discord-webhook
+   :can-edit nil                        ; a webhook cannot edit; buffer + send once
    :start-session (lambda (_meta) 'discord-webhook)
    :send #'agent-shell-bridge-discord--send
    :edit #'ignore

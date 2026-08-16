@@ -182,53 +182,53 @@ UPDATE is the value of (params update) in an ACP session notification."
 (defvar-local agent-shell-bridge--stream-text nil
   "Accumulated text of the open streaming message.")
 
+(defun agent-shell-bridge--stream-message (status)
+  "Build a message for the open stream with STATUS."
+  (agent-shell-bridge-make-message
+   :id agent-shell-bridge--stream-id
+   :role agent-shell-bridge--stream-role
+   :status status
+   :collapsible (eq agent-shell-bridge--stream-role 'thinking)
+   :parts (list (agent-shell-bridge-make-part
+                 :kind 'text :content agent-shell-bridge--stream-text))))
+
 (defun agent-shell-bridge--flush-stream ()
-  "Mark the open streaming message complete and clear stream state."
-  (when agent-shell-bridge--stream-id
-    (agent-shell-bridge--edit
-     agent-shell-bridge--stream-id
-     (agent-shell-bridge-make-message
-      :id agent-shell-bridge--stream-id
-      :role agent-shell-bridge--stream-role
-      :status 'complete
-      :collapsible (eq agent-shell-bridge--stream-role 'thinking)
-      :parts (list (agent-shell-bridge-make-part
-                    :kind 'text :content agent-shell-bridge--stream-text)))))
+  "Emit the open streaming message as complete and clear stream state.
+Edits the live message when one was already sent (editing providers);
+otherwise sends it once now (non-editing providers buffered it)."
+  (when agent-shell-bridge--stream-role
+    (let ((msg (agent-shell-bridge--stream-message 'complete)))
+      (if agent-shell-bridge--stream-id
+          (agent-shell-bridge--edit agent-shell-bridge--stream-id msg)
+        (agent-shell-bridge--send msg))))
   (setq agent-shell-bridge--stream-id nil
         agent-shell-bridge--stream-role nil
         agent-shell-bridge--stream-text nil))
 
 (defun agent-shell-bridge--feed (message)
-  "Dispatch MESSAGE, coalescing consecutive streaming chunks in place."
+  "Dispatch MESSAGE, coalescing consecutive streaming chunks.
+Editing providers get live send-then-edit; non-editing providers get a
+single complete message on flush."
   (let ((role (plist-get message :role))
         (status (plist-get message :status)))
     (cond
      ;; Streaming agent/thought chunk: coalesce.
      ((and (eq status 'streaming) (memq role '(agent thinking)))
-      (let ((text (agent-shell-bridge-message-text message)))
-        (if (and agent-shell-bridge--stream-id
-                 (eq agent-shell-bridge--stream-role role))
-            (progn
-              (setq agent-shell-bridge--stream-text
-                    (concat agent-shell-bridge--stream-text text))
-              (agent-shell-bridge--edit
-               agent-shell-bridge--stream-id
-               (agent-shell-bridge-make-message
-                :id agent-shell-bridge--stream-id :role role :status 'streaming
-                :collapsible (eq role 'thinking)
-                :parts (list (agent-shell-bridge-make-part
-                              :kind 'text
-                              :content agent-shell-bridge--stream-text)))))
-          (agent-shell-bridge--flush-stream)
-          (setq agent-shell-bridge--stream-role role
-                agent-shell-bridge--stream-text text
-                agent-shell-bridge--stream-id
-                (agent-shell-bridge--send
-                 (agent-shell-bridge-make-message
-                  :role role :status 'streaming
-                  :collapsible (eq role 'thinking)
-                  :parts (list (agent-shell-bridge-make-part
-                                :kind 'text :content text))))))))
+      (unless (eq agent-shell-bridge--stream-role role)
+        (agent-shell-bridge--flush-stream)
+        (setq agent-shell-bridge--stream-role role
+              agent-shell-bridge--stream-text ""
+              agent-shell-bridge--stream-id nil))
+      (setq agent-shell-bridge--stream-text
+            (concat agent-shell-bridge--stream-text
+                    (agent-shell-bridge-message-text message)))
+      (when (agent-shell-bridge-provider-can-edit
+             (agent-shell-bridge-active-provider))
+        (let ((msg (agent-shell-bridge--stream-message 'streaming)))
+          (if agent-shell-bridge--stream-id
+              (agent-shell-bridge--edit agent-shell-bridge--stream-id msg)
+            (setq agent-shell-bridge--stream-id
+                  (agent-shell-bridge--send msg))))))
      ;; Anything else: flush the open stream first, then send discretely.
      (t
       (agent-shell-bridge--flush-stream)

@@ -21,8 +21,12 @@
 (cl-defstruct (agent-shell-bridge-provider
                (:constructor agent-shell-bridge-provider-create)
                (:copier nil))
-  "A transport provider.  Each slot below is a function."
+  "A transport provider.  Each slot below is a function unless noted."
   name
+  ;; non-nil if `edit' actually mutates a delivered message.  When nil, the
+  ;; core buffers streaming chunks and emits one complete message on flush
+  ;; instead of send-then-edit (a webhook cannot edit).
+  can-edit
   ;; (session-meta) -> session-handle
   start-session
   ;; (message) -> remote-msg-id

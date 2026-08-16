@@ -117,6 +117,32 @@
      (should (string-match-p "\\[tool/pending\\]" (nth 1 lines)))
      (should (string-match-p "\\[agent/complete\\] Done" (nth 2 lines))))))
 
+(ert-deftest asb-non-editing-provider-buffers-and-sends-once-on-flush ()
+  "A provider that cannot edit must get one complete send, never partials."
+  (let* ((sends nil) (edits 0)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'capture :can-edit nil
+                    :start-session (lambda (_) 'capture)
+                    :send (lambda (m) (push m sends) nil)
+                    :edit (lambda (_id _m) (cl-incf edits))
+                    :delete #'ignore :on-inbound #'ignore
+                    :on-control #'ignore :stop #'ignore)))
+    (agent-shell-bridge-register-provider provider)
+    (agent-shell-bridge-set-provider 'capture)
+    (with-temp-buffer
+      (agent-shell-bridge--feed
+       (agent-shell-bridge--normalize-update (asb-test--agent-update "Hel")))
+      (agent-shell-bridge--feed
+       (agent-shell-bridge--normalize-update (asb-test--agent-update "lo")))
+      ;; nothing delivered yet: buffered, no send, no edit
+      (should (null sends))
+      (should (= edits 0))
+      (agent-shell-bridge--flush-stream))
+    (should (= (length sends) 1))
+    (should (= edits 0))
+    (should (eq (plist-get (car sends) :status) 'complete))
+    (should (equal (agent-shell-bridge-message-text (car sends)) "Hello"))))
+
 (ert-deftest asb-echo-edit-replaces-in-place ()
   (asb-test--with-echo
    (let ((id (agent-shell-bridge-echo--send

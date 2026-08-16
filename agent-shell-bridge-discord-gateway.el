@@ -293,6 +293,7 @@ Return the decoded JSON response, or nil."
   "Return the two-way Discord gateway provider."
   (agent-shell-bridge-provider-create
    :name 'discord-gateway
+   :can-edit t
    :start-session (lambda (_meta)
                     (agent-shell-bridge-discord-gateway-connect)
                     'discord-gateway)

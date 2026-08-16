@@ -90,6 +90,7 @@
   "Return a freshly-built echo provider."
   (agent-shell-bridge-provider-create
    :name 'echo
+   :can-edit t
    :start-session (lambda (meta) (or (plist-get meta :name) 'echo-session))
    :send #'agent-shell-bridge-echo--send
    :edit #'agent-shell-bridge-echo--edit
