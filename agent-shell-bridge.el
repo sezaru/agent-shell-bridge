@@ -335,6 +335,43 @@ new one."
         (when (and session-id (not existing))
           (agent-shell-bridge--save-handle session-id handle))))))
 
+(defvar agent-shell-bridge--relink-functions nil
+  "Abnormal hook run with the provider HANDLE when a resumed session is
+re-linked to its persisted post.  Providers can reconcile offline
+backlog (e.g. reject messages typed while the client was closed).")
+
+(defun agent-shell-bridge--try-relink ()
+  "Re-register a resumed session's persisted post in the ownership map.
+Return non-nil once resolved -- either the buffer was relinked to its
+saved post, or the session is new (no saved post; its post opens on the
+first prompt).  Return nil only while the ACP session id is not yet
+available after a resume, so the caller can retry."
+  (if agent-shell-bridge--session-started
+      t
+    (let ((session-id (agent-shell-bridge--session-id)))
+      (cond
+       ((null session-id) nil)          ; resume handshake not finished yet
+       ((agent-shell-bridge--load-handle session-id)
+        (let ((handle (agent-shell-bridge--load-handle session-id)))
+          (setq agent-shell-bridge--session-started t
+                agent-shell-bridge--session-handle handle)
+          (puthash handle (current-buffer) agent-shell-bridge--session->buffer)
+          (run-hook-with-args 'agent-shell-bridge--relink-functions handle)
+          t))
+       (t t)))))                        ; known session, no saved post => new
+
+(defun agent-shell-bridge--relink-session (&optional attempts)
+  "Try to relink this buffer; retry for a while as the session id appears."
+  (unless (agent-shell-bridge--try-relink)
+    (when (< (or attempts 0) 20)
+      (let ((buf (current-buffer)))
+        (run-with-timer
+         1 nil
+         (lambda ()
+           (when (buffer-live-p buf)
+             (with-current-buffer buf
+               (agent-shell-bridge--relink-session (1+ (or attempts 0)))))))))))
+
 (defun agent-shell-bridge--active-buffers ()
   "Buffers with `agent-shell-bridge-mode' enabled."
   (seq-filter (lambda (b) (buffer-local-value 'agent-shell-bridge-mode b))
@@ -694,8 +731,11 @@ ORIG-FN and ARGS are the advised call."
 (defun agent-shell-bridge--enable ()
   (agent-shell-bridge--require-provider)
   (agent-shell-bridge--install-advice)
-  ;; The session (e.g. the forum post) opens lazily on the first prompt so
-  ;; it can be titled with that prompt -- see `--on-send-command'.
+  ;; A brand-new session opens its post lazily on the first prompt (so it
+  ;; can be titled by it -- see `--on-send-command').  A RESUMED session
+  ;; already has a persisted post: relink it now so inbound remote messages
+  ;; route without waiting for a local prompt.
+  (agent-shell-bridge--relink-session)
   (let ((provider (agent-shell-bridge-active-provider)))
     (funcall (agent-shell-bridge-provider-on-inbound provider)
              #'agent-shell-bridge--dispatch-inbound)

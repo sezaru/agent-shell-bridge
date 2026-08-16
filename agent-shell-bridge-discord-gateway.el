@@ -337,6 +337,14 @@ consumed and must not be injected into a conversation that moved on."
       (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
     stale))
 
+(defun agent-shell-bridge-discord--reject-relinked-backlog (handle)
+  "Reject offline backlog in a just-relinked forum post HANDLE.
+Runs on resume: messages typed into the post while Emacs was closed were
+never processed, so they get ❌ (the same treatment as the cold-reconnect
+sweep) instead of silently lingering unacknowledged."
+  (when (stringp handle)
+    (ignore-errors (agent-shell-bridge-discord--reject-stale handle))))
+
 (defun agent-shell-bridge-discord--sweep-forum ()
   "Reject unprocessed backlog in this instance's OWN posts only.
 Restricted to owned threads so a shared bot never touches another
@@ -519,6 +527,9 @@ instance's or session's posts."
   (setq agent-shell-bridge-discord--react-fn
         (lambda (thread-id message-id emoji)
           (agent-shell-bridge-discord--react thread-id message-id emoji)))
+  ;; On resume, reject whatever was typed into the post while we were closed.
+  (add-hook 'agent-shell-bridge--relink-functions
+            #'agent-shell-bridge-discord--reject-relinked-backlog)
   (when (and agent-shell-bridge-discord-bot-token (featurep 'websocket))
     (ignore-errors (agent-shell-bridge-discord-gateway-connect))))
 

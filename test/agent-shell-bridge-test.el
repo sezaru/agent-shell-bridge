@@ -242,6 +242,58 @@
             (should (equal agent-shell-bridge--session-handle "new-thread"))))
       (delete-file agent-shell-bridge-session-file))))
 
+(ert-deftest asb-relink-registers-resumed-session-without-a-prompt ()
+  "On resume, the persisted post is re-registered so inbound routes early."
+  (let ((agent-shell-bridge-session-file (make-temp-file "asb-sessions" nil ".eld"))
+        (relinked nil))
+    (unwind-protect
+        (let ((provider (agent-shell-bridge-provider-create
+                         :name 'discord :start-session (lambda (_) (error "must not create"))
+                         :send #'ignore :edit #'ignore :delete #'ignore
+                         :on-inbound #'ignore :on-control #'ignore :stop #'ignore))
+              (agent-shell-bridge--relink-functions
+               (list (lambda (h) (setq relinked h)))))
+          (agent-shell-bridge-register-provider provider)
+          (agent-shell-bridge-set-provider 'discord)
+          (agent-shell-bridge--save-handle "sid-7" "thread-7")
+          (with-temp-buffer
+            (setq-local agent-shell--state '((:session . ((:id . "sid-7")))))
+            (should (agent-shell-bridge--try-relink))
+            (should agent-shell-bridge--session-started)
+            (should (equal agent-shell-bridge--session-handle "thread-7"))
+            (should (equal (gethash "thread-7" agent-shell-bridge--session->buffer)
+                           (current-buffer)))
+            (should (equal relinked "thread-7"))
+            (remhash "thread-7" agent-shell-bridge--session->buffer)))
+      (delete-file agent-shell-bridge-session-file))))
+
+(ert-deftest asb-relink-waits-when-session-id-absent ()
+  "Relink defers (returns nil) until the resumed session id is available."
+  (let ((agent-shell-bridge-session-file (make-temp-file "asb-sessions" nil ".eld")))
+    (unwind-protect
+        (with-temp-buffer
+          ;; no agent-shell--state yet -> session id unknown -> not resolved
+          (should (null (agent-shell-bridge--try-relink)))
+          (should (null agent-shell-bridge--session-started)))
+      (delete-file agent-shell-bridge-session-file))))
+
+(ert-deftest asb-relink-new-session-resolves-without-registering ()
+  "A known session with no saved post is a new session: resolve, don't link."
+  (let ((agent-shell-bridge-session-file (make-temp-file "asb-sessions" nil ".eld")))
+    (unwind-protect
+        (let ((provider (agent-shell-bridge-provider-create
+                         :name 'discord :start-session #'ignore :send #'ignore
+                         :edit #'ignore :delete #'ignore :on-inbound #'ignore
+                         :on-control #'ignore :stop #'ignore)))
+          (agent-shell-bridge-register-provider provider)
+          (agent-shell-bridge-set-provider 'discord)
+          (with-temp-buffer
+            (setq-local agent-shell--state '((:session . ((:id . "brand-new")))))
+            (should (agent-shell-bridge--try-relink))       ; resolved
+            (should (null agent-shell-bridge--session-started))   ; but not started
+            (should (null agent-shell-bridge--session-handle))))
+      (delete-file agent-shell-bridge-session-file))))
+
 (ert-deftest asb-send-command-uses-first-prompt-as-title ()
   (let* ((started nil)
          (provider (agent-shell-bridge-provider-create
