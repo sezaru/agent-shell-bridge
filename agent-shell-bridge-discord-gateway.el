@@ -191,7 +191,9 @@ Return a keyword describing the event so the live loop can react:
 
 (defun agent-shell-bridge-discord--rest-request (method path body)
   "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
-Return the decoded JSON response, or nil."
+Reactions and status swaps (PUT/DELETE) fire-and-forget so the UI thread
+never blocks on them; GET/POST run synchronously and return the decoded
+JSON response, or nil."
   (let* ((url (concat agent-shell-bridge-discord--api-base path))
          (args (append
                 (list "-s" "-X" method
@@ -199,11 +201,18 @@ Return the decoded JSON response, or nil."
                                    agent-shell-bridge-discord-bot-token)
                       "-H" "Content-Type: application/json")
                 (when body (list "-d" (json-encode body)))
-                (list url)))
-         (out (with-output-to-string
-                (with-current-buffer standard-output
-                  (apply #'call-process "curl" nil t nil args)))))
-    (ignore-errors (json-parse-string out :object-type 'alist))))
+                (list url))))
+    (if (member method '("PUT" "DELETE"))
+        (progn
+          (ignore-errors
+            (apply #'make-process
+                   :name "asb-discord-rest" :noquery t :buffer nil
+                   :sentinel #'ignore :command (cons "curl" args)))
+          nil)
+      (let ((out (with-output-to-string
+                   (with-current-buffer standard-output
+                     (apply #'call-process "curl" nil t nil args)))))
+        (ignore-errors (json-parse-string out :object-type 'alist))))))
 
 (defvar agent-shell-bridge-discord--rest-fn
   #'agent-shell-bridge-discord--rest-request
