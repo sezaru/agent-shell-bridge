@@ -242,8 +242,25 @@ single complete message on flush."
 (defvar-local agent-shell-bridge--session-handle nil
   "This buffer's provider session handle.")
 
+(defvar-local agent-shell-bridge--session-started nil
+  "Non-nil once the provider session for this buffer has been opened.")
+
+(defvar-local agent-shell-bridge--session-title nil
+  "Title for this buffer's session: the first prompt, like agent-shell.")
+
 (defvar-local agent-shell-bridge--from-remote nil
   "Non-nil while injecting a remote prompt, to avoid echo loops.")
+
+(defun agent-shell-bridge--ensure-session (&optional title)
+  "Open this buffer's provider session once, titled TITLE."
+  (unless agent-shell-bridge--session-started
+    (setq agent-shell-bridge--session-started t)
+    (let* ((provider (agent-shell-bridge-active-provider))
+           (handle (funcall (agent-shell-bridge-provider-start-session provider)
+                            (list :name (buffer-name) :title title))))
+      (setq agent-shell-bridge--session-handle handle)
+      (when handle
+        (puthash handle (current-buffer) agent-shell-bridge--session->buffer)))))
 
 (defun agent-shell-bridge--active-buffers ()
   "Buffers with `agent-shell-bridge-mode' enabled."
@@ -339,10 +356,37 @@ ORIG-FN and ARGS are the advised call."
                (buffer-local-value 'agent-shell-bridge-mode buffer))
       (let* ((notification (plist-get args :acp-notification))
              (update (map-nested-elt notification '(params update)))
-             (message (and update (agent-shell-bridge--normalize-update update))))
+             ;; User prompts are mirrored authoritatively via the
+             ;; send-command advice; skip the (possibly replayed) chunk to
+             ;; avoid a duplicate.
+             (message (and update
+                           (not (equal (alist-get 'sessionUpdate update)
+                                       "user_message_chunk"))
+                           (agent-shell-bridge--normalize-update update))))
         (when message
           (with-current-buffer buffer
             (agent-shell-bridge--feed message))))))
+  (apply orig-fn args))
+
+(defun agent-shell-bridge--on-send-command (orig-fn &rest args)
+  "Around-advice for `agent-shell--send-command'.
+Open the session titled by the first prompt and mirror the prompt as a
+user message.  ORIG-FN and ARGS are the advised call."
+  (when (bound-and-true-p agent-shell-bridge-mode)
+    (let ((prompt (plist-get args :prompt)))
+      (when (and prompt (> (length prompt) 0))
+        (unless agent-shell-bridge--session-started
+          (setq agent-shell-bridge--session-title prompt))
+        (agent-shell-bridge--ensure-session agent-shell-bridge--session-title)
+        ;; A prompt injected from the remote is already visible there.
+        (unless agent-shell-bridge--from-remote
+          (agent-shell-bridge--flush-stream)
+          (agent-shell-bridge--send
+           (agent-shell-bridge-make-message
+            :role 'user :status 'complete
+            :parts (list (agent-shell-bridge-make-part
+                          :kind 'text :content prompt))))))))
+  (setq agent-shell-bridge--from-remote nil)
   (apply orig-fn args))
 
 (defun agent-shell-bridge--on-request (orig-fn &rest args)
@@ -379,6 +423,8 @@ ORIG-FN and ARGS are the advised call."
                 #'agent-shell-bridge--on-notification)
     (advice-add 'agent-shell--on-request :around
                 #'agent-shell-bridge--on-request)
+    (advice-add 'agent-shell--send-command :around
+                #'agent-shell-bridge--on-send-command)
     (setq agent-shell-bridge--advice-installed t)))
 
 (defvar-local agent-shell-bridge--turn-subscription nil
@@ -387,12 +433,9 @@ ORIG-FN and ARGS are the advised call."
 (defun agent-shell-bridge--enable ()
   (agent-shell-bridge--require-provider)
   (agent-shell-bridge--install-advice)
-  (let* ((provider (agent-shell-bridge-active-provider))
-         (handle (funcall (agent-shell-bridge-provider-start-session provider)
-                          (list :name (buffer-name)))))
-    (setq agent-shell-bridge--session-handle handle)
-    (when handle
-      (puthash handle (current-buffer) agent-shell-bridge--session->buffer))
+  ;; The session (e.g. the forum post) opens lazily on the first prompt so
+  ;; it can be titled with that prompt -- see `--on-send-command'.
+  (let ((provider (agent-shell-bridge-active-provider)))
     (funcall (agent-shell-bridge-provider-on-inbound provider)
              #'agent-shell-bridge--dispatch-inbound)
     (funcall (agent-shell-bridge-provider-on-control provider)

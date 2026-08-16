@@ -182,7 +182,8 @@ When the session opened a forum post, thread the message under it."
   "Open a forum post per session when forum mode is on; else a flat handle."
   (if agent-shell-bridge-discord-forum-p
       (or (agent-shell-bridge-discord--create-post
-           (or (plist-get meta :name) "agent-shell session"))
+           (or (plist-get meta :title) (plist-get meta :name)
+               "agent-shell session"))
           (progn (message "agent-shell-bridge: forum post creation failed")
                  'discord-webhook))
     'discord-webhook))

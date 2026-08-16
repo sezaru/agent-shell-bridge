@@ -143,6 +143,45 @@
     (should (eq (plist-get (car sends) :status) 'complete))
     (should (equal (agent-shell-bridge-message-text (car sends)) "Hello"))))
 
+(ert-deftest asb-send-command-titles-session-and-mirrors-prompt ()
+  "First prompt opens the session titled by it and posts as a user message."
+  (let* ((sends nil) (started nil)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'cap :can-edit nil
+                    :start-session (lambda (meta) (setq started meta) "thread-1")
+                    :send (lambda (m) (push m sends) nil)
+                    :edit #'ignore :delete #'ignore
+                    :on-inbound #'ignore :on-control #'ignore :stop #'ignore)))
+    (agent-shell-bridge-register-provider provider)
+    (agent-shell-bridge-set-provider 'cap)
+    (with-temp-buffer
+      (setq-local agent-shell-bridge-mode t)
+      (agent-shell-bridge--on-send-command #'ignore :prompt "Refactor the parser")
+      ;; a second prompt must NOT re-open the session
+      (setq started nil)
+      (agent-shell-bridge--on-send-command #'ignore :prompt "now the AST")
+      (should (null started))
+      (should (equal agent-shell-bridge--session-handle "thread-1")))
+    (setq sends (reverse sends))
+    (should (equal (plist-get (nth 0 sends) :role) 'user))
+    (should (equal (agent-shell-bridge-message-text (nth 0 sends))
+                   "Refactor the parser"))
+    (should (equal (agent-shell-bridge-message-text (nth 1 sends)) "now the AST"))))
+
+(ert-deftest asb-send-command-uses-first-prompt-as-title ()
+  (let* ((started nil)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'cap2 :can-edit nil
+                    :start-session (lambda (meta) (setq started meta) "t")
+                    :send #'ignore :edit #'ignore :delete #'ignore
+                    :on-inbound #'ignore :on-control #'ignore :stop #'ignore)))
+    (agent-shell-bridge-register-provider provider)
+    (agent-shell-bridge-set-provider 'cap2)
+    (with-temp-buffer
+      (setq-local agent-shell-bridge-mode t)
+      (agent-shell-bridge--on-send-command #'ignore :prompt "Build the thing"))
+    (should (equal (plist-get started :title) "Build the thing"))))
+
 (ert-deftest asb-echo-edit-replaces-in-place ()
   (asb-test--with-echo
    (let ((id (agent-shell-bridge-echo--send
