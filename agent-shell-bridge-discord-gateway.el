@@ -1,0 +1,323 @@
+;;; agent-shell-bridge-discord-gateway.el --- Two-way Discord provider -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;;; Commentary:
+
+;; The gateway (bot) Discord provider: full two-way parity.  Outbound is
+;; the REST API (so messages have ids we can edit / react to); inbound is
+;; the Gateway websocket.  MESSAGE_CREATE in the session channel injects a
+;; prompt; reactions map to the transport-neutral control vocabulary
+;; (approve/deny/expand/collapse/full/hide/interrupt).
+;;
+;; The pure pieces -- opcode/payload builders, the event dispatch router,
+;; reaction mapping, inbound routing, REST body construction -- are unit
+;; tested.  The live connect/heartbeat loop needs a bot token and is
+;; guarded behind `websocket'; it is exercised by manual verification, not
+;; ERT.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'json)
+(require 'map)
+(require 'agent-shell-bridge)
+(require 'agent-shell-bridge-provider)
+(require 'agent-shell-bridge-discord)
+(require 'websocket nil t)
+
+;;;; Config
+
+(defcustom agent-shell-bridge-discord-bot-token nil
+  "Discord bot token.  Read from environment/authinfo; never hard-code."
+  :type '(choice (const nil) string)
+  :group 'agent-shell-bridge)
+
+(defcustom agent-shell-bridge-discord-channel-id nil
+  "Discord channel id the session mirrors to and listens on."
+  :type '(choice (const nil) string)
+  :group 'agent-shell-bridge)
+
+(defconst agent-shell-bridge-discord--gateway-url
+  "wss://gateway.discord.gg/?v=10&encoding=json")
+
+(defconst agent-shell-bridge-discord--api-base "https://discord.com/api/v10")
+
+;;;; Gateway opcodes and intents
+
+(defconst agent-shell-bridge-discord--op-dispatch 0)
+(defconst agent-shell-bridge-discord--op-heartbeat 1)
+(defconst agent-shell-bridge-discord--op-identify 2)
+(defconst agent-shell-bridge-discord--op-resume 6)
+(defconst agent-shell-bridge-discord--op-reconnect 7)
+(defconst agent-shell-bridge-discord--op-invalid-session 9)
+(defconst agent-shell-bridge-discord--op-hello 10)
+(defconst agent-shell-bridge-discord--op-heartbeat-ack 11)
+
+;; GUILD_MESSAGES(512) + GUILD_MESSAGE_REACTIONS(1024) + DIRECT_MESSAGES(4096)
+;; + DIRECT_MESSAGE_REACTIONS(8192) + MESSAGE_CONTENT(32768) = 46592.
+;; MESSAGE_CONTENT is a privileged intent; enable it in the dev portal.
+(defconst agent-shell-bridge-discord--intents 46592
+  "Gateway intents: guild+DM messages, reactions, and message content.")
+
+;;;; Payload builders
+
+(defun agent-shell-bridge-discord--identify-payload (token intents)
+  "Build an IDENTIFY payload for TOKEN with INTENTS."
+  `((op . ,agent-shell-bridge-discord--op-identify)
+    (d . ((token . ,token)
+          (intents . ,intents)
+          (properties . ((os . "linux")
+                         (browser . "agent-shell-bridge")
+                         (device . "agent-shell-bridge")))))))
+
+(defun agent-shell-bridge-discord--heartbeat-payload (seq)
+  "Build a HEARTBEAT payload acknowledging sequence SEQ (may be nil)."
+  `((op . ,agent-shell-bridge-discord--op-heartbeat)
+    (d . ,seq)))
+
+(defun agent-shell-bridge-discord--resume-payload (token session-id seq)
+  "Build a RESUME payload for TOKEN, SESSION-ID at SEQ."
+  `((op . ,agent-shell-bridge-discord--op-resume)
+    (d . ((token . ,token)
+          (session_id . ,session-id)
+          (seq . ,seq)))))
+
+;;;; Reaction -> control action
+
+(defun agent-shell-bridge-discord--reaction-action (emoji)
+  "Map a reaction EMOJI name to a transport-neutral control action, or nil."
+  (pcase emoji
+    ("✅" 'approve)
+    ("❌" 'deny)
+    ("👀" 'expand)
+    ("🔽" 'collapse)
+    ("📄" 'full)
+    ("🙈" 'hide)
+    ("🛑" 'interrupt)
+    (_ nil)))
+
+;;;; Gateway session state
+
+(cl-defstruct (agent-shell-bridge-discord-gateway
+               (:constructor agent-shell-bridge-discord-gateway-create)
+               (:copier nil))
+  token intents socket
+  (seq nil) (session-id nil) (bot-user-id nil) (heartbeat-interval nil)
+  (resume-url nil) on-inbound on-control)
+
+;;;; Inbound / reaction routing (pure)
+
+(defun agent-shell-bridge-discord--route-message-create (gw d)
+  "Route a MESSAGE_CREATE payload D through GW's inbound callback.
+Ignores the bot's own messages and empty content."
+  (let* ((author (alist-get 'author d))
+         (author-id (alist-get 'id author))
+         (is-bot (eq (alist-get 'bot author) t))
+         (content (alist-get 'content d))
+         (channel (alist-get 'channel_id d))
+         (cb (agent-shell-bridge-discord-gateway-on-inbound gw)))
+    (when (and cb content (not (string-empty-p content))
+               (not is-bot)
+               (not (equal author-id
+                           (agent-shell-bridge-discord-gateway-bot-user-id gw))))
+      (funcall cb (list :text content :session channel)))))
+
+(defun agent-shell-bridge-discord--route-reaction (gw d)
+  "Route a MESSAGE_REACTION_ADD/REMOVE payload D through GW's control callback."
+  (let* ((emoji (alist-get 'name (alist-get 'emoji d)))
+         (action (agent-shell-bridge-discord--reaction-action emoji))
+         (msg-id (alist-get 'message_id d))
+         (cb (agent-shell-bridge-discord-gateway-on-control gw)))
+    (when (and cb action)
+      (funcall cb (list :action action :target msg-id
+                        :session (alist-get 'channel_id d))))))
+
+;;;; Event dispatch router (pure)
+
+(defun agent-shell-bridge-discord--on-gateway-event (gw event)
+  "Advance GW state from a decoded gateway EVENT.
+Return a keyword describing the event so the live loop can react:
+`:hello', `:dispatch', `:reconnect', `:invalid-session', or `:other'."
+  (let ((op (alist-get 'op event))
+        (seq (alist-get 's event))
+        (type (alist-get 't event))
+        (d (alist-get 'd event)))
+    (when seq (setf (agent-shell-bridge-discord-gateway-seq gw) seq))
+    (cond
+     ((eql op agent-shell-bridge-discord--op-hello)
+      (setf (agent-shell-bridge-discord-gateway-heartbeat-interval gw)
+            (alist-get 'heartbeat_interval d))
+      :hello)
+     ((eql op agent-shell-bridge-discord--op-reconnect) :reconnect)
+     ((eql op agent-shell-bridge-discord--op-invalid-session) :invalid-session)
+     ((eql op agent-shell-bridge-discord--op-dispatch)
+      (pcase type
+        ("READY"
+         (setf (agent-shell-bridge-discord-gateway-session-id gw)
+               (alist-get 'session_id d)
+               (agent-shell-bridge-discord-gateway-bot-user-id gw)
+               (alist-get 'id (alist-get 'user d))
+               (agent-shell-bridge-discord-gateway-resume-url gw)
+               (alist-get 'resume_gateway_url d)))
+        ("MESSAGE_CREATE"
+         (agent-shell-bridge-discord--route-message-create gw d))
+        ((or "MESSAGE_REACTION_ADD" "MESSAGE_REACTION_REMOVE")
+         (agent-shell-bridge-discord--route-reaction gw d)))
+      :dispatch)
+     (t :other))))
+
+;;;; REST transport
+
+(defun agent-shell-bridge-discord--rest-request (method path body)
+  "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
+Return the decoded JSON response, or nil."
+  (let* ((url (concat agent-shell-bridge-discord--api-base path))
+         (args (append
+                (list "-s" "-X" method
+                      "-H" (format "Authorization: Bot %s"
+                                   agent-shell-bridge-discord-bot-token)
+                      "-H" "Content-Type: application/json")
+                (when body (list "-d" (json-encode body)))
+                (list url)))
+         (out (with-output-to-string
+                (with-current-buffer standard-output
+                  (apply #'call-process "curl" nil t nil args)))))
+    (ignore-errors (json-parse-string out :object-type 'alist))))
+
+(defvar agent-shell-bridge-discord--rest-fn
+  #'agent-shell-bridge-discord--rest-request
+  "Function of (METHOD PATH BODY) performing a REST call.  Rebound in tests.")
+
+(defun agent-shell-bridge-discord--rest (method path &optional body)
+  (funcall agent-shell-bridge-discord--rest-fn method path body))
+
+(defun agent-shell-bridge-discord-gateway--send (message)
+  "POST flattened MESSAGE to the session channel; return the message id."
+  (let* ((path (format "/channels/%s/messages"
+                       agent-shell-bridge-discord-channel-id))
+         (resp (agent-shell-bridge-discord--rest
+                "POST" path
+                `((content . ,(agent-shell-bridge-discord--flatten message))))))
+    (alist-get 'id resp)))
+
+(defun agent-shell-bridge-discord-gateway--edit (remote-id message)
+  "Edit REMOTE-ID to the flattened MESSAGE via REST."
+  (agent-shell-bridge-discord--rest
+   "PATCH"
+   (format "/channels/%s/messages/%s"
+           agent-shell-bridge-discord-channel-id remote-id)
+   `((content . ,(agent-shell-bridge-discord--flatten message)))))
+
+(defun agent-shell-bridge-discord-gateway--delete (remote-id)
+  "Delete REMOTE-ID via REST."
+  (agent-shell-bridge-discord--rest
+   "DELETE"
+   (format "/channels/%s/messages/%s"
+           agent-shell-bridge-discord-channel-id remote-id)))
+
+;;;; Live connection (guarded; not unit tested)
+
+(defvar agent-shell-bridge-discord--gw nil
+  "The active gateway session struct.")
+(defvar agent-shell-bridge-discord--heartbeat-timer nil)
+
+(defun agent-shell-bridge-discord--gw-send-json (gw payload)
+  (websocket-send-text (agent-shell-bridge-discord-gateway-socket gw)
+                       (json-encode payload)))
+
+(defun agent-shell-bridge-discord--start-heartbeat (gw)
+  (when agent-shell-bridge-discord--heartbeat-timer
+    (cancel-timer agent-shell-bridge-discord--heartbeat-timer))
+  (let ((secs (/ (agent-shell-bridge-discord-gateway-heartbeat-interval gw)
+                 1000.0)))
+    (setq agent-shell-bridge-discord--heartbeat-timer
+          (run-at-time secs secs
+                       (lambda ()
+                         (agent-shell-bridge-discord--gw-send-json
+                          gw (agent-shell-bridge-discord--heartbeat-payload
+                              (agent-shell-bridge-discord-gateway-seq gw))))))))
+
+(defun agent-shell-bridge-discord--gw-on-message (gw _ws frame)
+  (let ((event (ignore-errors
+                 (json-parse-string (websocket-frame-text frame)
+                                    :object-type 'alist))))
+    (when event
+      (pcase (agent-shell-bridge-discord--on-gateway-event gw event)
+        (:hello
+         (agent-shell-bridge-discord--start-heartbeat gw)
+         (agent-shell-bridge-discord--gw-send-json
+          gw (agent-shell-bridge-discord--identify-payload
+              (agent-shell-bridge-discord-gateway-token gw)
+              (agent-shell-bridge-discord-gateway-intents gw))))
+        (:reconnect (agent-shell-bridge-discord-gateway-connect))
+        (:invalid-session (agent-shell-bridge-discord-gateway-connect))))))
+
+(defun agent-shell-bridge-discord-gateway-connect ()
+  "Open the Discord gateway websocket.  Requires `websocket'."
+  (unless (featurep 'websocket)
+    (error "The `websocket' package is required for the gateway provider"))
+  (unless agent-shell-bridge-discord-bot-token
+    (error "agent-shell-bridge-discord-bot-token is not set"))
+  (let ((gw (or agent-shell-bridge-discord--gw
+                (setq agent-shell-bridge-discord--gw
+                      (agent-shell-bridge-discord-gateway-create
+                       :token agent-shell-bridge-discord-bot-token
+                       :intents agent-shell-bridge-discord--intents)))))
+    (setf (agent-shell-bridge-discord-gateway-socket gw)
+          (websocket-open
+           agent-shell-bridge-discord--gateway-url
+           :on-message (lambda (ws frame)
+                         (agent-shell-bridge-discord--gw-on-message gw ws frame))))
+    gw))
+
+(defun agent-shell-bridge-discord-gateway--stop ()
+  (when agent-shell-bridge-discord--heartbeat-timer
+    (cancel-timer agent-shell-bridge-discord--heartbeat-timer)
+    (setq agent-shell-bridge-discord--heartbeat-timer nil))
+  (when (and agent-shell-bridge-discord--gw
+             (agent-shell-bridge-discord-gateway-socket
+              agent-shell-bridge-discord--gw))
+    (websocket-close (agent-shell-bridge-discord-gateway-socket
+                      agent-shell-bridge-discord--gw)))
+  (setq agent-shell-bridge-discord--gw nil))
+
+;;;; Provider
+
+(defun agent-shell-bridge-discord-gateway-provider ()
+  "Return the two-way Discord gateway provider."
+  (agent-shell-bridge-provider-create
+   :name 'discord-gateway
+   :start-session (lambda (_meta)
+                    (agent-shell-bridge-discord-gateway-connect)
+                    'discord-gateway)
+   :send #'agent-shell-bridge-discord-gateway--send
+   :edit #'agent-shell-bridge-discord-gateway--edit
+   :delete #'agent-shell-bridge-discord-gateway--delete
+   :on-inbound (lambda (cb)
+                 (when agent-shell-bridge-discord--gw
+                   (setf (agent-shell-bridge-discord-gateway-on-inbound
+                          agent-shell-bridge-discord--gw)
+                         cb)))
+   :on-control (lambda (cb)
+                 (when agent-shell-bridge-discord--gw
+                   (setf (agent-shell-bridge-discord-gateway-on-control
+                          agent-shell-bridge-discord--gw)
+                         cb)))
+   :stop #'agent-shell-bridge-discord-gateway--stop))
+
+;;;###autoload
+(defun agent-shell-bridge-discord-gateway-register ()
+  "Register and select the two-way Discord gateway provider."
+  (interactive)
+  (agent-shell-bridge-register-provider
+   (agent-shell-bridge-discord-gateway-provider))
+  (agent-shell-bridge-set-provider 'discord-gateway))
+
+(provide 'agent-shell-bridge-discord-gateway)
+;;; agent-shell-bridge-discord-gateway.el ends here

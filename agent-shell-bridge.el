@@ -234,6 +234,99 @@ UPDATE is the value of (params update) in an ACP session notification."
       (agent-shell-bridge--flush-stream)
       (agent-shell-bridge--send message)))))
 
+;;;; Inbound injection and control (remote -> agent-shell)
+
+(defvar agent-shell-bridge--session->buffer (make-hash-table :test 'equal)
+  "Map a provider session-handle to its agent-shell buffer.")
+
+(defvar-local agent-shell-bridge--session-handle nil
+  "This buffer's provider session handle.")
+
+(defvar-local agent-shell-bridge--from-remote nil
+  "Non-nil while injecting a remote prompt, to avoid echo loops.")
+
+(defun agent-shell-bridge--active-buffers ()
+  "Buffers with `agent-shell-bridge-mode' enabled."
+  (seq-filter (lambda (b) (buffer-local-value 'agent-shell-bridge-mode b))
+              (buffer-list)))
+
+(defun agent-shell-bridge--buffer-for-session (session)
+  "Resolve SESSION handle to a buffer, falling back to the sole bridged one."
+  (or (gethash session agent-shell-bridge--session->buffer)
+      (car (agent-shell-bridge--active-buffers))))
+
+(defun agent-shell-bridge-inject (text &optional buffer)
+  "Inject TEXT as a prompt into BUFFER (an `agent-shell' buffer).
+Queues when the shell is busy."
+  (with-current-buffer (or buffer (current-buffer))
+    (when (derived-mode-p 'agent-shell-mode)
+      (if (and (fboundp 'shell-maker-busy) (shell-maker-busy))
+          (when (fboundp 'agent-shell--enqueue-request)
+            (agent-shell--enqueue-request :prompt text))
+        (setq agent-shell-bridge--from-remote t)
+        (save-excursion (goto-char (point-max)) (insert text))
+        (goto-char (point-max))
+        (when (fboundp 'shell-maker-submit)
+          (call-interactively #'shell-maker-submit))))))
+
+(defun agent-shell-bridge--dispatch-inbound (event)
+  "Handle an inbound EVENT (:text :session) by injecting into its buffer."
+  (let ((buffer (agent-shell-bridge--buffer-for-session
+                 (plist-get event :session))))
+    (when (buffer-live-p buffer)
+      (agent-shell-bridge-inject (plist-get event :text) buffer))))
+
+;;; Permission requests mirrored to the remote await a control action.
+
+(defvar agent-shell-bridge--pending-permissions nil
+  "Alist of remote-msg-id -> (:request-id :buffer :options).")
+
+(defun agent-shell-bridge--find-option-id (options action)
+  "Return the ACP option id in OPTIONS matching ACTION (approve/always/deny)."
+  (cl-loop for opt in (append options nil)
+           for id = (or (alist-get 'optionId opt) (alist-get 'id opt))
+           for kind = (alist-get 'kind opt)
+           when (pcase action
+                  ('approve (member kind '("allow" "accept" "allow_once")))
+                  ('always  (member kind '("always" "alwaysAllow" "allow_always")))
+                  ('deny    (member kind '("deny" "reject" "reject_once"))))
+           return id))
+
+(defun agent-shell-bridge--resolve-permission (remote-id action)
+  "Resolve the pending permission for REMOTE-ID with ACTION."
+  (when-let* ((entry (assoc remote-id agent-shell-bridge--pending-permissions))
+              (info (cdr entry))
+              (buffer (plist-get info :buffer)))
+    (when (and (buffer-live-p buffer)
+               (fboundp 'agent-shell--send-permission-response))
+      (when-let* ((option-id (agent-shell-bridge--find-option-id
+                              (plist-get info :options) action)))
+        (with-current-buffer buffer
+          (let ((state (bound-and-true-p agent-shell--state)))
+            (agent-shell--send-permission-response
+             :client (alist-get :client state)
+             :request-id (plist-get info :request-id)
+             :option-id option-id
+             :state state)))
+        (setq agent-shell-bridge--pending-permissions
+              (assoc-delete-all remote-id
+                                agent-shell-bridge--pending-permissions))))))
+
+(defun agent-shell-bridge-handle-control (event)
+  "Handle a remote control EVENT (:action :target :session).
+Approve/deny resolve permissions; interrupt stops the agent.  Expansion
+actions (expand/collapse/full/hide) are provider-side concerns."
+  (let ((action (plist-get event :action))
+        (target (plist-get event :target)))
+    (pcase action
+      ((or 'approve 'deny)
+       (agent-shell-bridge--resolve-permission target action))
+      ('interrupt
+       (dolist (b (agent-shell-bridge--active-buffers))
+         (with-current-buffer b
+           (when (fboundp 'agent-shell-interrupt)
+             (ignore-errors (agent-shell-interrupt t)))))))))
+
 ;;;; Capture layer (advice around agent-shell internals)
 
 (defun agent-shell-bridge--on-notification (orig-fn &rest args)
@@ -264,8 +357,15 @@ ORIG-FN and ARGS are the advised call."
                (equal (alist-get 'method request) "session/request_permission"))
       (with-current-buffer buffer
         (agent-shell-bridge--flush-stream)
-        (agent-shell-bridge--send
-         (agent-shell-bridge--normalize-permission request)))))
+        (let ((remote-id (agent-shell-bridge--send
+                          (agent-shell-bridge--normalize-permission request))))
+          (when remote-id
+            (push (cons remote-id
+                        (list :request-id (alist-get 'id request)
+                              :buffer buffer
+                              :options (alist-get 'options
+                                                  (alist-get 'params request))))
+                  agent-shell-bridge--pending-permissions))))))
   (apply orig-fn args))
 
 ;;;; Minor mode
@@ -287,7 +387,17 @@ ORIG-FN and ARGS are the advised call."
   :lighter " Bridge"
   (when agent-shell-bridge-mode
     (agent-shell-bridge--require-provider)
-    (agent-shell-bridge--install-advice)))
+    (agent-shell-bridge--install-advice)
+    (let* ((provider (agent-shell-bridge-active-provider))
+           (handle (funcall (agent-shell-bridge-provider-start-session provider)
+                            (list :name (buffer-name)))))
+      (setq agent-shell-bridge--session-handle handle)
+      (when handle
+        (puthash handle (current-buffer) agent-shell-bridge--session->buffer))
+      (funcall (agent-shell-bridge-provider-on-inbound provider)
+               #'agent-shell-bridge--dispatch-inbound)
+      (funcall (agent-shell-bridge-provider-on-control provider)
+               #'agent-shell-bridge-handle-control))))
 
 (provide 'agent-shell-bridge)
 ;;; agent-shell-bridge.el ends here
