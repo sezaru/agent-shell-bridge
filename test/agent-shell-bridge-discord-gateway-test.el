@@ -109,6 +109,38 @@
     (should (member "-d" (agent-shell-bridge-discord--rest-args
                           "POST" "/x" '((content . "hi")))))))
 
+(ert-deftest asb-gw-rest-put-passes-command-as-a-list ()
+  "Regression (fa1b217): PUT/DELETE fire via make-process and its :command
+MUST be the full curl list.  The old code `apply'd it, spreading curl's
+flags into make-process keyword slots so the request silently never fired
+and no bot reaction ever appeared."
+  (let ((agent-shell-bridge-discord-bot-token "TK")
+        (captured nil) (calls 0))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (setq captured args) (cl-incf calls) 'proc)))
+      (agent-shell-bridge-discord--rest-request
+       "PUT" "/channels/c/messages/m/reactions/x/@me" nil))
+    (should (= calls 1))
+    (let ((command (plist-get captured :command)))
+      (should (listp command))                     ; not the bare string "curl"
+      (should (equal (car command) "curl"))
+      (should (member "PUT" command))
+      (should (seq-every-p #'stringp command)))
+    ;; the arg plist must be well-formed: every key is a keyword.  Under the
+    ;; apply-spread bug, curl flag strings ("-s", "-X", …) land in key slots.
+    (should (cl-loop for (k _v) on captured by #'cddr always (keywordp k)))))
+
+(ert-deftest asb-gw-rest-get-is-synchronous-and-parses ()
+  "GET/POST run synchronously (never make-process) and return parsed JSON."
+  (let ((agent-shell-bridge-discord-bot-token "TK") (made nil))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest _) (setq made t) 'proc))
+              ((symbol-function 'call-process)
+               (lambda (&rest _) (insert "{\"id\":\"z\"}") 0)))
+      (let ((resp (agent-shell-bridge-discord--rest-request "GET" "/x" nil)))
+        (should (null made))
+        (should (equal (alist-get 'id resp) "z"))))))
+
 ;;;; REST send/edit (stubbed transport)
 
 (ert-deftest asb-gw-send-posts-message-and-returns-id ()

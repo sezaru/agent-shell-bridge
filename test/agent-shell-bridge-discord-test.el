@@ -167,6 +167,22 @@
       (should (= (length posts) 1))
       (should (string-prefix-p "-# Thinking" (car posts))))))
 
+(ert-deftest asb-discord-async-http-uses-list-command ()
+  "Every async HTTP fires make-process with :command a proper list -- guards
+the same apply-spread class of bug that silently dropped bot reactions."
+  (let ((captured nil))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (push (plist-get args :command) captured) 'proc))
+              ((symbol-function 'make-temp-file) (lambda (&rest _) "/tmp/asb-test-x")))
+      (agent-shell-bridge-discord--curl-post-async "https://h" "hi")
+      (agent-shell-bridge-discord--curl-edit-async "https://h/messages/1" "hi")
+      (agent-shell-bridge-discord--curl-upload-async "https://h" "t.md" "data"))
+    (should (= (length captured) 3))
+    (dolist (cmd captured)
+      (should (listp cmd))
+      (should (equal (car cmd) "curl"))
+      (should (seq-every-p #'stringp cmd)))))
+
 (ert-deftest asb-discord-send-file-part-uploads ()
   ;; A message carrying a file part (e.g. /transcript) uploads as an attachment.
   (let* ((captured nil)
