@@ -143,6 +143,39 @@
     (should (eq (plist-get (car sends) :status) 'complete))
     (should (equal (agent-shell-bridge-message-text (car sends)) "Hello"))))
 
+(defun asb-test--tool-call-notif (id cmd)
+  `((method . "session/update")
+    (params . ((update . ((sessionUpdate . "tool_call")
+                          (toolCallId . ,id)
+                          (rawInput . ((command . ,cmd)))))))))
+
+(ert-deftest asb-advice-mirrors-nothing-until-session-started ()
+  "Replayed / pre-prompt notifications must not reach the provider."
+  (let* ((sends 0)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'cap3 :can-edit nil
+                    :start-session (lambda (_) "t")
+                    :send (lambda (_m) (cl-incf sends) nil)
+                    :edit #'ignore :delete #'ignore :on-inbound #'ignore
+                    :on-control #'ignore :stop #'ignore)))
+    (agent-shell-bridge-register-provider provider)
+    (agent-shell-bridge-set-provider 'cap3)
+    (with-temp-buffer
+      (setq-local agent-shell-bridge-mode t)
+      ;; session not started yet -> dropped
+      (agent-shell-bridge--on-notification
+       #'ignore
+       :state (list (cons :buffer (current-buffer)))
+       :acp-notification (asb-test--tool-call-notif "t1" "ls"))
+      (should (= sends 0))
+      ;; once started, it flows
+      (setq agent-shell-bridge--session-started t)
+      (agent-shell-bridge--on-notification
+       #'ignore
+       :state (list (cons :buffer (current-buffer)))
+       :acp-notification (asb-test--tool-call-notif "t2" "pwd"))
+      (should (= sends 1)))))
+
 (ert-deftest asb-send-command-titles-session-and-mirrors-prompt ()
   "First prompt opens the session titled by it and posts as a user message."
   (let* ((sends nil) (started nil)

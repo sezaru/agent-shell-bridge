@@ -353,7 +353,11 @@ ORIG-FN and ARGS are the advised call."
   (let* ((state (plist-get args :state))
          (buffer (alist-get :buffer state)))
     (when (and buffer (buffer-live-p buffer)
-               (buffer-local-value 'agent-shell-bridge-mode buffer))
+               (buffer-local-value 'agent-shell-bridge-mode buffer)
+               ;; Nothing is mirrored until the first prompt opened the
+               ;; session -- keeps replayed history and pre-prompt chatter
+               ;; from creating/spamming a remote surface.
+               (buffer-local-value 'agent-shell-bridge--session-started buffer))
       (let* ((notification (plist-get args :acp-notification))
              (update (map-nested-elt notification '(params update)))
              ;; User prompts are mirrored authoritatively via the
@@ -398,6 +402,7 @@ ORIG-FN and ARGS are the advised call."
          (buffer (and state (alist-get :buffer state))))
     (when (and buffer (buffer-live-p buffer)
                (buffer-local-value 'agent-shell-bridge-mode buffer)
+               (buffer-local-value 'agent-shell-bridge--session-started buffer)
                (equal (alist-get 'method request) "session/request_permission"))
       (with-current-buffer buffer
         (agent-shell-bridge--flush-stream)
