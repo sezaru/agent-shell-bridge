@@ -1,4 +1,4 @@
-;;; agent-shell-bridge-discord.el --- Discord provider for the bridge -*- lexical-binding: t; -*-
+;;; agent-shell-bridge-discord.el --- Discord bot provider core -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 
@@ -9,35 +9,44 @@
 
 ;;; Commentary:
 
-;; Discord provider.  This file ships the read-only *webhook* variant: a
-;; single HTTPS POST per message, no bot/gateway/intents, mobile push out
-;; of the box.  `edit'/`delete'/`on-inbound'/`on-control' are no-ops here
-;; (a webhook cannot edit or receive) -- the gateway variant adds those.
+;; The Discord provider's outbound half: rendering, the activity
+;; aggregator, and the bot REST transport.  Everything speaks to Discord
+;; through the *bot token* -- there is no webhook.  A session opens one
+;; forum post (a thread) and every message posts under it via
+;; `POST /channels/{thread}/messages'; the bot edits its own messages
+;; (activity subtext) and reacts (permission taps, status).  The inbound
+;; half -- the gateway websocket listener -- lives in
+;; `agent-shell-bridge-discord-gateway'.
 ;;
 ;; The flattener collapses a structured message to a single Discord
-;; message: role header, fenced tool/code/diff bodies, thinking wrapped in
-;; a spoiler (Discord's closest analogue to agent-shell's collapsed
-;; thinking), and hard truncation to the 2000-char cap.
+;; message: role header, hard truncation to the 2000-char cap, thinking
+;; and tool calls folded into one edited "Thought, ran a command" subtext.
+;; This is Discord-specific and lossy on purpose; the core still forwards
+;; the full structured stream, so a richer provider can consume every
+;; thinking chunk and tool call instead of discarding them.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'json)
+(require 'url-util)
 (require 'agent-shell-bridge)
 (require 'agent-shell-bridge-provider)
 
-(defcustom agent-shell-bridge-discord-webhook-url nil
-  "Discord webhook URL to POST mirrored messages to.
-Read from the environment/authinfo; never hard-code a secret here."
+(defcustom agent-shell-bridge-discord-bot-token nil
+  "Discord bot token.  Read from environment/authinfo; never hard-code."
+  :type '(choice (const nil) string)
+  :group 'agent-shell-bridge)
+
+(defcustom agent-shell-bridge-discord-channel-id nil
+  "Discord forum channel id the sessions post under and the bot listens on."
   :type '(choice (const nil) string)
   :group 'agent-shell-bridge)
 
 (defcustom agent-shell-bridge-discord-forum-p nil
-  "When non-nil, treat the webhook's channel as a forum channel.
-Each session opens one forum post (via `thread_name'); all of its messages
-thread under that post via `?thread_id='.  Requires the webhook to live on
-a forum/media channel -- a plain text channel cannot create threads from a
-webhook."
+  "When non-nil, open one forum post (thread) per session.
+Each session's messages thread under that post.  Requires
+`agent-shell-bridge-discord-channel-id' to name a forum/media channel."
   :type 'boolean
   :group 'agent-shell-bridge)
 
@@ -55,9 +64,80 @@ webhook."
 A bare trailing newline is trimmed by Discord; the zero-width space after
 it survives, yielding one blank line of separation.")
 
+(defconst agent-shell-bridge-discord--api-base "https://discord.com/api/v10"
+  "Base URL for the Discord REST API.")
+
 (defun agent-shell-bridge-discord--separated (content)
   "CONTENT with the trailing blank-line separator appended."
   (concat content agent-shell-bridge-discord--separator))
+
+;;;; REST transport (bot token)
+
+(defun agent-shell-bridge-discord--rest-args (method path body)
+  "The curl argument list (after \"curl\") for METHOD PATH with BODY."
+  (append
+   (list "-s" "-X" method
+         "-H" (format "Authorization: Bot %s" agent-shell-bridge-discord-bot-token)
+         "-H" "Content-Type: application/json")
+   (when body (list "-d" (json-encode body)))
+   (list (concat agent-shell-bridge-discord--api-base path))))
+
+(defun agent-shell-bridge-discord--rest-request (method path body)
+  "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
+Reactions and status swaps (PUT/DELETE) fire-and-forget so the UI thread
+never blocks on them; GET/POST/PATCH run synchronously and return the
+decoded JSON response, or nil."
+  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
+    (if (member method '("PUT" "DELETE"))
+        (progn
+          ;; NB: `:command' must receive the list itself -- never `apply' the
+          ;; args here, or curl's flags get parsed as make-process keywords
+          ;; and the request silently never fires (breaking every reaction).
+          (ignore-errors
+            (make-process
+             :name "asb-discord-rest" :noquery t :buffer nil
+             :sentinel #'ignore :command (cons "curl" args)))
+          nil)
+      (let ((out (with-output-to-string
+                   (with-current-buffer standard-output
+                     (apply #'call-process "curl" nil t nil args)))))
+        (ignore-errors (json-parse-string out :object-type 'alist))))))
+
+(defvar agent-shell-bridge-discord--rest-fn
+  #'agent-shell-bridge-discord--rest-request
+  "Function of (METHOD PATH BODY) performing a REST call.  Rebound in tests.")
+
+(defun agent-shell-bridge-discord--rest (method path &optional body)
+  (funcall agent-shell-bridge-discord--rest-fn method path body))
+
+(defun agent-shell-bridge-discord--rest-async (method path body)
+  "Fire METHOD PATH with BODY (alist or nil) without waiting; return nil.
+Keeps Emacs responsive -- used for ordinary message posts and edits, whose
+response we do not need back."
+  (ignore-errors
+    (make-process
+     :name "asb-discord-rest" :noquery t :buffer nil :sentinel #'ignore
+     :command (cons "curl" (agent-shell-bridge-discord--rest-args method path body))))
+  nil)
+
+;;;; Reactions
+
+(defconst agent-shell-bridge-discord--mark-consumed "✅")
+(defconst agent-shell-bridge-discord--mark-rejected "❌")
+
+(defun agent-shell-bridge-discord--react (channel-id message-id emoji)
+  "Add EMOJI as the bot's reaction to MESSAGE-ID in CHANNEL-ID."
+  (agent-shell-bridge-discord--rest
+   "PUT"
+   (format "/channels/%s/messages/%s/reactions/%s/@me"
+           channel-id message-id (url-hexify-string emoji))))
+
+(defun agent-shell-bridge-discord--mark (channel-id message-id consumed)
+  "Mark MESSAGE-ID consumed (✅) when CONSUMED, else rejected (❌)."
+  (agent-shell-bridge-discord--react
+   channel-id message-id
+   (if consumed agent-shell-bridge-discord--mark-consumed
+     agent-shell-bridge-discord--mark-rejected)))
 
 ;;;; Rendering
 
@@ -112,12 +192,12 @@ here, and return nil."
 ;;;; Activity aggregator (one evolving "Thought, ran a command" subtext)
 
 ;; A turn's thinking + tool calls collapse into a single subtext line we
-;; post once and then EDIT in place (webhook messages are editable via
+;; post once and then EDIT in place (the bot edits its own message via
 ;; PATCH .../messages/{id}), exactly like agent-shell's collapsed header.
 ;; Phrasing is lifted from agent-shell's tool-call-kind table.  Turn
 ;; boundaries arrive via `set-status' (t = new turn, nil = turn done).
 
-(defvar agent-shell-bridge-discord--post-fn)   ; defined in Transport, below
+(defvar agent-shell-bridge-discord--post-fn)   ; defined in Bot outbound, below
 (defvar agent-shell-bridge-discord--edit-fn)
 
 (defconst agent-shell-bridge-discord--tool-phrases
@@ -179,14 +259,12 @@ here, and return nil."
     (when (and summary (not (equal summary agent-shell-bridge-discord--act-rendered)))
       (setq agent-shell-bridge-discord--act-rendered summary)
       (let ((content (agent-shell-bridge-discord--separated (concat "-# " summary)))
-            (url (agent-shell-bridge-discord--target-url)))
+            (thread (agent-shell-bridge-discord--post-channel)))
         (if agent-shell-bridge-discord--act-id
             (funcall agent-shell-bridge-discord--edit-fn
-                     (agent-shell-bridge-discord--edit-url
-                      agent-shell-bridge-discord--act-id)
-                     content)
+                     thread agent-shell-bridge-discord--act-id content)
           (setq agent-shell-bridge-discord--act-id
-                (funcall agent-shell-bridge-discord--post-fn url content)))))))
+                (funcall agent-shell-bridge-discord--post-fn thread content)))))))
 
 (defun agent-shell-bridge-discord--act-note-thinking ()
   (setq agent-shell-bridge-discord--act-thought t
@@ -234,81 +312,67 @@ here, and return nil."
   (agent-shell-bridge-discord--act-touch)
   (agent-shell-bridge-discord--act-reset))
 
-;;;; Transport
+;;;; Bot outbound operations
 
-(defun agent-shell-bridge-discord--curl-post (url content)
-  "POST CONTENT to webhook URL via curl; return the created message id."
-  (let* ((json (json-encode `(("content" . ,content))))
-         (out (with-output-to-string
-                (with-current-buffer standard-output
-                  (call-process "curl" nil t nil
-                                "-s" "-X" "POST"
-                                "-H" "Content-Type: application/json"
-                                "-d" json url))))
-         (data (ignore-errors (json-parse-string out :object-type 'alist))))
-    (alist-get 'id data)))
+(defun agent-shell-bridge-discord--bot-post-sync (thread content)
+  "POST CONTENT to THREAD synchronously; return the created message id."
+  (alist-get 'id (agent-shell-bridge-discord--rest
+                  "POST" (format "/channels/%s/messages" thread)
+                  `((content . ,content)))))
 
-(defvar agent-shell-bridge-discord--post-fn
-  #'agent-shell-bridge-discord--curl-post
-  "Function of (URL CONTENT) that POSTs and returns the message id.
-Used only when the id is needed back (permission correlation).  Rebound
-in tests.")
+(defun agent-shell-bridge-discord--bot-post-async (thread content)
+  "Fire-and-forget POST of CONTENT to THREAD."
+  (agent-shell-bridge-discord--rest-async
+   "POST" (format "/channels/%s/messages" thread)
+   `((content . ,content))))
 
-(defun agent-shell-bridge-discord--curl-post-async (url content)
-  "Fire-and-forget POST of CONTENT to webhook URL; return nil immediately.
-Keeps Emacs responsive -- the mirrored message id is not needed."
-  (let ((json (json-encode `(("content" . ,content)))))
-    (ignore-errors
-      (make-process
-       :name "asb-discord-post" :noquery t :buffer nil :sentinel #'ignore
-       :command (list "curl" "-s" "-X" "POST"
-                      "-H" "Content-Type: application/json"
-                      "-d" json url))))
-  nil)
+(defun agent-shell-bridge-discord--bot-edit-async (thread id content)
+  "Fire-and-forget PATCH of message ID in THREAD to CONTENT."
+  (agent-shell-bridge-discord--rest-async
+   "PATCH" (format "/channels/%s/messages/%s" thread id)
+   `((content . ,content))))
 
-(defvar agent-shell-bridge-discord--post-async-fn
-  #'agent-shell-bridge-discord--curl-post-async
-  "Function of (URL CONTENT) that POSTs without waiting.  Rebound in tests.")
-
-(defun agent-shell-bridge-discord--curl-edit-async (url content)
-  "Fire-and-forget PATCH setting CONTENT on the webhook message at URL."
-  (let ((json (json-encode `(("content" . ,content)))))
-    (ignore-errors
-      (make-process
-       :name "asb-discord-edit" :noquery t :buffer nil :sentinel #'ignore
-       :command (list "curl" "-s" "-X" "PATCH"
-                      "-H" "Content-Type: application/json"
-                      "-d" json url))))
-  nil)
-
-(defvar agent-shell-bridge-discord--edit-fn
-  #'agent-shell-bridge-discord--curl-edit-async
-  "Function of (URL CONTENT) that PATCHes a webhook message.  Rebound in tests.")
-
-(defun agent-shell-bridge-discord--curl-upload-async (url name data)
-  "Fire-and-forget multipart POST attaching DATA as file NAME to URL."
+(defun agent-shell-bridge-discord--bot-upload-async (thread name data)
+  "Fire-and-forget multipart upload of DATA as file NAME to THREAD."
   (let ((tmp (make-temp-file "asb-discord-" nil ".txt" data)))
     (condition-case _
         (make-process
          :name "asb-discord-upload" :noquery t :buffer nil
          :sentinel (lambda (_p _e) (ignore-errors (delete-file tmp)))
          :command (list "curl" "-s" "-X" "POST"
+                        "-H" (format "Authorization: Bot %s"
+                                     agent-shell-bridge-discord-bot-token)
                         "-F" (format "files[0]=@%s;filename=%s;type=text/plain" tmp name)
-                        url))
+                        (concat agent-shell-bridge-discord--api-base
+                                (format "/channels/%s/messages" thread))))
       (error (ignore-errors (delete-file tmp)))))
   nil)
 
+;; Outbound operations are indirected through these vars so tests can
+;; capture payloads without touching the network; production uses the bot
+;; REST implementations above.
+(defvar agent-shell-bridge-discord--post-fn
+  #'agent-shell-bridge-discord--bot-post-sync
+  "Function (THREAD CONTENT) -> message-id, posting synchronously.
+Used when the id is needed back (activity first post, permission).")
+
+(defvar agent-shell-bridge-discord--post-async-fn
+  #'agent-shell-bridge-discord--bot-post-async
+  "Function (THREAD CONTENT) -> nil, posting without waiting.")
+
+(defvar agent-shell-bridge-discord--edit-fn
+  #'agent-shell-bridge-discord--bot-edit-async
+  "Function (THREAD MESSAGE-ID CONTENT) -> nil, editing without waiting.")
+
 (defvar agent-shell-bridge-discord--upload-fn
-  #'agent-shell-bridge-discord--curl-upload-async
-  "Function of (URL NAME DATA) uploading a file attachment.  Rebound in tests.")
+  #'agent-shell-bridge-discord--bot-upload-async
+  "Function (THREAD NAME DATA) -> nil, uploading a file attachment.")
 
-(defvar agent-shell-bridge-discord--react-fn nil
-  "Function of (THREAD-ID MESSAGE-ID EMOJI) reacting via the bot, or nil.
-Set by the gateway so permission messages get tappable ✅/❌ affordances.")
+(defvar agent-shell-bridge-discord--react-fn
+  #'agent-shell-bridge-discord--react
+  "Function (THREAD MESSAGE-ID EMOJI), reacting via the bot.")
 
-(defun agent-shell-bridge-discord--with-wait (url)
-  "Append the wait=true query param to URL so the POST returns the message."
-  (concat url (if (string-search "?" url) "&" "?") "wait=true"))
+;;;; Targeting
 
 (defun agent-shell-bridge-discord--session-thread ()
   "The current buffer's forum thread id, if any."
@@ -316,109 +380,64 @@ Set by the gateway so permission messages get tappable ✅/❌ affordances.")
                 agent-shell-bridge--session-handle)))
     (and (stringp h) h)))
 
-(defun agent-shell-bridge-discord--target-url ()
-  "The webhook URL for this buffer, threaded under its forum post if any."
-  (let ((thread (agent-shell-bridge-discord--session-thread)))
-    (agent-shell-bridge-discord--with-wait
-     (if thread
-         (format "%s?thread_id=%s" agent-shell-bridge-discord-webhook-url thread)
-       agent-shell-bridge-discord-webhook-url))))
+(defun agent-shell-bridge-discord--post-channel ()
+  "The channel/thread id this buffer's messages post to.
+The session's forum post when one exists, else the configured channel."
+  (or (agent-shell-bridge-discord--session-thread)
+      agent-shell-bridge-discord-channel-id))
 
-(defun agent-shell-bridge-discord--edit-url (id)
-  "The webhook edit URL for message ID, threaded under the forum post."
-  (let ((thread (agent-shell-bridge-discord--session-thread)))
-    (concat agent-shell-bridge-discord-webhook-url "/messages/" id
-            (if thread (format "?thread_id=%s" thread) ""))))
-
-(defun agent-shell-bridge-discord--post-permission (url content)
-  "Post a permission CONTENT to URL synchronously, then add tappable ✅/❌.
+(defun agent-shell-bridge-discord--post-permission (thread content)
+  "Post a permission CONTENT to THREAD synchronously, then add tappable ✅/❌.
 Returns the message id so the reaction can be correlated to the request."
-  (let ((id (funcall agent-shell-bridge-discord--post-fn url content)))
+  (let ((id (funcall agent-shell-bridge-discord--post-fn thread content)))
     (when (and id agent-shell-bridge-discord--react-fn)
-      (let ((thread (agent-shell-bridge-discord--session-thread)))
-        (funcall agent-shell-bridge-discord--react-fn thread id "✅")
-        (funcall agent-shell-bridge-discord--react-fn thread id "❌")))
+      (funcall agent-shell-bridge-discord--react-fn thread id "✅")
+      (funcall agent-shell-bridge-discord--react-fn thread id "❌"))
     id))
 
 (defun agent-shell-bridge-discord--send (message)
-  "Handle MESSAGE for the webhook.
+  "Handle MESSAGE for the bot.
 Thinking and tool messages fold into this turn's activity summary; a
 message with a file part uploads as an attachment (e.g. /transcript); a
 permission posts synchronously and gets tappable ✅/❌ reactions; the
 agent reply, user prompt and command replies post as normal messages.
-Threads under the session's forum post."
-  (unless agent-shell-bridge-discord-webhook-url
-    (error "agent-shell-bridge-discord-webhook-url is not set"))
+Posts under the session's forum post when one exists."
+  (unless agent-shell-bridge-discord-bot-token
+    (error "agent-shell-bridge-discord-bot-token is not set"))
   (pcase (plist-get message :role)
     ('thinking (agent-shell-bridge-discord--act-note-thinking) nil)
     ('tool (agent-shell-bridge-discord--act-note-tool message) nil)
     (_
-     (if-let* ((file (agent-shell-bridge-message-file message)))
-         (funcall agent-shell-bridge-discord--upload-fn
-                  (agent-shell-bridge-discord--target-url) (car file) (cdr file))
-       (when-let* ((content (agent-shell-bridge-discord--render message)))
-         (let ((url (agent-shell-bridge-discord--target-url))
-               (content (agent-shell-bridge-discord--separated content)))
-           (if (eq (plist-get message :role) 'permission)
-               (agent-shell-bridge-discord--post-permission url content)
-             (funcall agent-shell-bridge-discord--post-async-fn url content))))))))
+     (let ((thread (agent-shell-bridge-discord--post-channel)))
+       (if-let* ((file (agent-shell-bridge-message-file message)))
+           (funcall agent-shell-bridge-discord--upload-fn thread (car file) (cdr file))
+         (when-let* ((content (agent-shell-bridge-discord--render message)))
+           (let ((content (agent-shell-bridge-discord--separated content)))
+             (if (eq (plist-get message :role) 'permission)
+                 (agent-shell-bridge-discord--post-permission thread content)
+               (funcall agent-shell-bridge-discord--post-async-fn thread content)))))))))
 
-;;; Forum: one post per session
+;;;; Forum: one post per session
 
-(defun agent-shell-bridge-discord--curl-create (url json)
-  "POST JSON to URL and return the response body string."
-  (with-output-to-string
-    (with-current-buffer standard-output
-      (call-process "curl" nil t nil
-                    "-s" "-X" "POST"
-                    "-H" "Content-Type: application/json"
-                    "-d" json url))))
-
-(defvar agent-shell-bridge-discord--create-fn
-  #'agent-shell-bridge-discord--curl-create
-  "Function of (URL JSON) returning the response body.  Rebound in tests.")
-
-(defun agent-shell-bridge-discord--create-post (title)
-  "Create a forum post titled TITLE; return its thread id, or nil on failure."
-  (let* ((url (concat agent-shell-bridge-discord-webhook-url "?wait=true"))
-         (name (substring title 0 (min (length title) 100)))
-         (json (json-encode `(("thread_name" . ,name)
-                              ("content" . "🧵 Session started"))))
-         (resp (funcall agent-shell-bridge-discord--create-fn url json))
-         (data (ignore-errors (json-parse-string resp :object-type 'alist))))
-    ;; The forum starter message's channel_id is the new thread id.
-    (or (alist-get 'channel_id data) (alist-get 'id data))))
+(defun agent-shell-bridge-discord--create-thread (title)
+  "Create a forum post titled TITLE via the bot; return its thread id, or nil."
+  (let* ((name (substring title 0 (min (length title) 100)))
+         (resp (agent-shell-bridge-discord--rest
+                "POST" (format "/channels/%s/threads"
+                               agent-shell-bridge-discord-channel-id)
+                `((name . ,name)
+                  (message . ((content . "🧵 Session started")))))))
+    (alist-get 'id resp)))
 
 (defun agent-shell-bridge-discord--start-session (meta)
   "Open a forum post per session when forum mode is on; else a flat handle."
   (if agent-shell-bridge-discord-forum-p
-      (or (agent-shell-bridge-discord--create-post
+      (or (agent-shell-bridge-discord--create-thread
            (or (plist-get meta :title) (plist-get meta :name)
                "agent-shell session"))
           (progn (message "agent-shell-bridge: forum post creation failed")
-                 'discord-webhook))
-    'discord-webhook))
-
-(defun agent-shell-bridge-discord-webhook-provider ()
-  "Return the read-only Discord webhook provider."
-  (agent-shell-bridge-provider-create
-   :name 'discord-webhook
-   :can-edit nil                        ; a webhook cannot edit; buffer + send once
-   :start-session #'agent-shell-bridge-discord--start-session
-   :send #'agent-shell-bridge-discord--send
-   :edit #'ignore
-   :delete #'ignore
-   :on-inbound #'ignore
-   :on-control #'ignore
-   :stop #'ignore))
-
-;;;###autoload
-(defun agent-shell-bridge-discord-webhook-register ()
-  "Register and select the Discord webhook provider."
-  (interactive)
-  (agent-shell-bridge-register-provider
-   (agent-shell-bridge-discord-webhook-provider))
-  (agent-shell-bridge-set-provider 'discord-webhook))
+                 'discord))
+    'discord))
 
 (provide 'agent-shell-bridge-discord)
 ;;; agent-shell-bridge-discord.el ends here

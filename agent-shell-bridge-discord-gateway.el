@@ -34,15 +34,9 @@
 
 ;;;; Config
 
-(defcustom agent-shell-bridge-discord-bot-token nil
-  "Discord bot token.  Read from environment/authinfo; never hard-code."
-  :type '(choice (const nil) string)
-  :group 'agent-shell-bridge)
-
-(defcustom agent-shell-bridge-discord-channel-id nil
-  "Discord forum channel id the sessions post under and the bot listens on."
-  :type '(choice (const nil) string)
-  :group 'agent-shell-bridge)
+;; The bot token, channel id and REST transport live in
+;; `agent-shell-bridge-discord' (the outbound half); this file is the
+;; inbound half and reuses them.
 
 (defcustom agent-shell-bridge-discord-guild-id nil
   "Discord server (guild) id, used to enumerate active forum posts."
@@ -51,8 +45,6 @@
 
 (defconst agent-shell-bridge-discord--gateway-url
   "wss://gateway.discord.gg/?v=10&encoding=json")
-
-(defconst agent-shell-bridge-discord--api-base "https://discord.com/api/v10")
 
 ;;;; Gateway opcodes and intents
 
@@ -187,44 +179,7 @@ Return a keyword describing the event so the live loop can react:
       :dispatch)
      (t :other))))
 
-;;;; REST transport
-
-(defun agent-shell-bridge-discord--rest-args (method path body)
-  "The curl argument list (after \"curl\") for METHOD PATH with BODY."
-  (append
-   (list "-s" "-X" method
-         "-H" (format "Authorization: Bot %s" agent-shell-bridge-discord-bot-token)
-         "-H" "Content-Type: application/json")
-   (when body (list "-d" (json-encode body)))
-   (list (concat agent-shell-bridge-discord--api-base path))))
-
-(defun agent-shell-bridge-discord--rest-request (method path body)
-  "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
-Reactions and status swaps (PUT/DELETE) fire-and-forget so the UI thread
-never blocks on them; GET/POST run synchronously and return the decoded
-JSON response, or nil."
-  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
-    (if (member method '("PUT" "DELETE"))
-        (progn
-          ;; NB: `:command' must receive the list itself -- never `apply' the
-          ;; args here, or curl's flags get parsed as make-process keywords
-          ;; and the request silently never fires (breaking every reaction).
-          (ignore-errors
-            (make-process
-             :name "asb-discord-rest" :noquery t :buffer nil
-             :sentinel #'ignore :command (cons "curl" args)))
-          nil)
-      (let ((out (with-output-to-string
-                   (with-current-buffer standard-output
-                     (apply #'call-process "curl" nil t nil args)))))
-        (ignore-errors (json-parse-string out :object-type 'alist))))))
-
-(defvar agent-shell-bridge-discord--rest-fn
-  #'agent-shell-bridge-discord--rest-request
-  "Function of (METHOD PATH BODY) performing a REST call.  Rebound in tests.")
-
-(defun agent-shell-bridge-discord--rest (method path &optional body)
-  (funcall agent-shell-bridge-discord--rest-fn method path body))
+;;;; REST send/edit/delete (the pure gateway provider posts to the channel root)
 
 (defun agent-shell-bridge-discord-gateway--send (message)
   "POST flattened MESSAGE to the session channel; return the message id."
@@ -251,23 +206,8 @@ JSON response, or nil."
            agent-shell-bridge-discord-channel-id remote-id)))
 
 ;;;; Reaction markers: ✅ consumed, ❌ rejected
-
-(defconst agent-shell-bridge-discord--mark-consumed "✅")
-(defconst agent-shell-bridge-discord--mark-rejected "❌")
-
-(defun agent-shell-bridge-discord--react (channel-id message-id emoji)
-  "Add EMOJI as the bot's reaction to MESSAGE-ID in CHANNEL-ID."
-  (agent-shell-bridge-discord--rest
-   "PUT"
-   (format "/channels/%s/messages/%s/reactions/%s/@me"
-           channel-id message-id (url-hexify-string emoji))))
-
-(defun agent-shell-bridge-discord--mark (channel-id message-id consumed)
-  "Mark MESSAGE-ID consumed (✅) when CONSUMED, else rejected (❌)."
-  (agent-shell-bridge-discord--react
-   channel-id message-id
-   (if consumed agent-shell-bridge-discord--mark-consumed
-     agent-shell-bridge-discord--mark-rejected)))
+;; The `--react'/`--mark' primitives and their constants live in
+;; `agent-shell-bridge-discord'; the policy on top of them is here.
 
 (defun agent-shell-bridge-discord--bot-marked-p (message)
   "Non-nil if the bot already reacted ✅/❌ to MESSAGE."
@@ -488,7 +428,7 @@ instance's or session's posts."
    (agent-shell-bridge-discord-gateway-provider))
   (agent-shell-bridge-set-provider 'discord-gateway))
 
-;;;; Hybrid provider: webhook out (forum posts) + gateway in (listen/react)
+;;;; Hybrid provider: bot REST out (forum posts) + gateway in (listen/react)
 
 (defun agent-shell-bridge-discord--store-inbound (cb)
   (when agent-shell-bridge-discord--gw
@@ -501,10 +441,10 @@ instance's or session's posts."
            agent-shell-bridge-discord--gw) cb)))
 
 (defun agent-shell-bridge-discord-provider ()
-  "Return the hybrid Discord provider: webhook output, gateway listener."
+  "Return the hybrid Discord provider: bot REST output, gateway listener."
   (agent-shell-bridge-provider-create
    :name 'discord
-   :can-edit nil                        ; webhook out: buffer + post on complete
+   :can-edit nil                        ; buffer + post once on turn complete
    :start-session #'agent-shell-bridge-discord--start-session
    :send #'agent-shell-bridge-discord--send
    :edit #'ignore
@@ -528,10 +468,6 @@ instance's or session's posts."
   (interactive)
   (agent-shell-bridge-register-provider (agent-shell-bridge-discord-provider))
   (agent-shell-bridge-set-provider 'discord)
-  ;; Let the webhook side add tappable ✅/❌ to permission messages via the bot.
-  (setq agent-shell-bridge-discord--react-fn
-        (lambda (thread-id message-id emoji)
-          (agent-shell-bridge-discord--react thread-id message-id emoji)))
   ;; On resume, reject whatever was typed into the post while we were closed.
   (add-hook 'agent-shell-bridge--relink-functions
             #'agent-shell-bridge-discord--reject-relinked-backlog)

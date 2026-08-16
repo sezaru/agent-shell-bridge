@@ -25,7 +25,8 @@
   name
   ;; non-nil if `edit' actually mutates a delivered message.  When nil, the
   ;; core buffers streaming chunks and emits one complete message on flush
-  ;; instead of send-then-edit (a webhook cannot edit).
+  ;; instead of send-then-edit (e.g. the Discord provider buffers a turn
+  ;; and posts one message on complete).
   can-edit
   ;; (session-meta) -> session-handle
   start-session

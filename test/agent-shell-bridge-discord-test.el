@@ -1,9 +1,10 @@
 ;;; agent-shell-bridge-discord-test.el --- Discord provider tests -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; ERT tests for the Discord webhook provider: the foreground flattener,
-;; the background activity aggregator (verb table + in-place editing), and
-;; `send' payload routing (no network).
+;; ERT tests for the Discord bot provider's outbound half: the foreground
+;; flattener, the background activity aggregator (verb table + in-place
+;; editing), bot REST targeting (forum thread creation, per-thread posts),
+;; and `send' routing.  No network -- the REST/seam functions are stubbed.
 
 ;;; Code:
 
@@ -76,11 +77,10 @@
 (ert-deftest asb-discord-activity-summary-thought-then-command ()
   (with-temp-buffer
     (let* ((posts nil) (edits nil)
-           (agent-shell-bridge-discord-webhook-url "https://hook")
            (agent-shell-bridge-discord--post-fn
-            (lambda (_u c) (push c posts) "act-1"))
+            (lambda (_thread c) (push c posts) "act-1"))
            (agent-shell-bridge-discord--edit-fn
-            (lambda (_u c) (push c edits) nil)))
+            (lambda (_thread _id c) (push c edits) nil)))
       ;; thinking -> "Thinking" (first post, sync, gets id)
       (agent-shell-bridge-discord--act-note-thinking)
       (should (string-prefix-p "-# Thinking" (car posts)))
@@ -96,9 +96,8 @@
 (ert-deftest asb-discord-activity-counts-multiple-and-groups ()
   (with-temp-buffer
     (let* ((last nil)
-           (agent-shell-bridge-discord-webhook-url "https://hook")
-           (agent-shell-bridge-discord--post-fn (lambda (_u c) (setq last c) "id"))
-           (agent-shell-bridge-discord--edit-fn (lambda (_u c) (setq last c) nil)))
+           (agent-shell-bridge-discord--post-fn (lambda (_thread c) (setq last c) "id"))
+           (agent-shell-bridge-discord--edit-fn (lambda (_thread _id c) (setq last c) nil)))
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "a" "execute" 'pending))
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "a" "execute" 'success))
       (agent-shell-bridge-discord--act-note-tool (asb-test--tool-msg "b" "execute" 'pending))
@@ -109,9 +108,8 @@
 
 (ert-deftest asb-discord-activity-finalize-then-reset ()
   (with-temp-buffer
-    (let ((agent-shell-bridge-discord-webhook-url "https://hook")
-          (agent-shell-bridge-discord--post-fn (lambda (_u _c) "id"))
-          (agent-shell-bridge-discord--edit-fn (lambda (_u _c) nil)))
+    (let ((agent-shell-bridge-discord--post-fn (lambda (_thread _c) "id"))
+          (agent-shell-bridge-discord--edit-fn (lambda (_thread _id _c) nil)))
       (agent-shell-bridge-discord--act-note-thinking)
       (should agent-shell-bridge-discord--act-id)
       (agent-shell-bridge-discord--act-finalize)
@@ -124,9 +122,10 @@
 (ert-deftest asb-discord-send-posts-flattened-payload-async ()
   ;; Ordinary messages fire async (no id needed) so Enter stays snappy.
   (let* ((captured nil) (sync-called nil)
-         (agent-shell-bridge-discord-webhook-url "https://example.test/hook")
+         (agent-shell-bridge-discord-bot-token "TK")
+         (agent-shell-bridge-discord-channel-id "chan-1")
          (agent-shell-bridge-discord--post-async-fn
-          (lambda (url content) (setq captured (list url content))))
+          (lambda (thread content) (setq captured (list thread content))))
          (agent-shell-bridge-discord--post-fn
           (lambda (&rest _) (setq sync-called t))))
     (agent-shell-bridge-discord--send
@@ -134,17 +133,19 @@
       :role 'agent :status 'complete
       :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
     (should (null sync-called))
-    (should (equal (nth 0 captured) "https://example.test/hook?wait=true"))
+    ;; no session handle -> posts to the configured channel
+    (should (equal (nth 0 captured) "chan-1"))
     (should (string-prefix-p "🤖 **Agent**\nhi" (nth 1 captured)))
     ;; each message ends with the blank-line separator
     (should (string-suffix-p agent-shell-bridge-discord--separator (nth 1 captured)))))
 
 (ert-deftest asb-discord-send-permission-is-sync-with-id ()
   ;; Permission posts synchronously and returns its id (for reaction correlation).
-  (let* ((agent-shell-bridge-discord-webhook-url "https://hook")
+  (let* ((agent-shell-bridge-discord-bot-token "TK")
+         (agent-shell-bridge-discord--react-fn #'ignore)
          (agent-shell-bridge-discord--post-async-fn
           (lambda (&rest _) (error "permission must not fire async")))
-         (agent-shell-bridge-discord--post-fn (lambda (_u _c) "perm-9")))
+         (agent-shell-bridge-discord--post-fn (lambda (_thread _c) "perm-9")))
     (should (equal (agent-shell-bridge-discord--send
                     (agent-shell-bridge-make-message
                      :role 'permission :status 'pending
@@ -156,8 +157,8 @@
   ;; A thinking message posts the activity subtext, not a normal message.
   (with-temp-buffer
     (let* ((posts nil)
-           (agent-shell-bridge-discord-webhook-url "https://hook")
-           (agent-shell-bridge-discord--post-fn (lambda (_u c) (push c posts) "id"))
+           (agent-shell-bridge-discord-bot-token "TK")
+           (agent-shell-bridge-discord--post-fn (lambda (_thread c) (push c posts) "id"))
            (agent-shell-bridge-discord--post-async-fn
             (lambda (&rest _) (error "thinking must not post a normal message"))))
       (agent-shell-bridge-discord--send
@@ -167,28 +168,69 @@
       (should (= (length posts) 1))
       (should (string-prefix-p "-# Thinking" (car posts))))))
 
+;;;; Bot REST outbound
+
 (ert-deftest asb-discord-async-http-uses-list-command ()
-  "Every async HTTP fires make-process with :command a proper list -- guards
-the same apply-spread class of bug that silently dropped bot reactions."
-  (let ((captured nil))
+  "Every async HTTP fires make-process with :command a proper list of
+strings -- guards the apply-spread class of bug that silently dropped bot
+reactions -- and carries the bot Authorization header."
+  (let ((captured nil)
+        (agent-shell-bridge-discord-bot-token "TK"))
     (cl-letf (((symbol-function 'make-process)
                (lambda (&rest args) (push (plist-get args :command) captured) 'proc))
               ((symbol-function 'make-temp-file) (lambda (&rest _) "/tmp/asb-test-x")))
-      (agent-shell-bridge-discord--curl-post-async "https://h" "hi")
-      (agent-shell-bridge-discord--curl-edit-async "https://h/messages/1" "hi")
-      (agent-shell-bridge-discord--curl-upload-async "https://h" "t.md" "data"))
+      (agent-shell-bridge-discord--bot-post-async "thread-1" "hi")
+      (agent-shell-bridge-discord--bot-edit-async "thread-1" "m-1" "hi")
+      (agent-shell-bridge-discord--bot-upload-async "thread-1" "t.md" "data"))
     (should (= (length captured) 3))
     (dolist (cmd captured)
       (should (listp cmd))
       (should (equal (car cmd) "curl"))
-      (should (seq-every-p #'stringp cmd)))))
+      (should (seq-every-p #'stringp cmd))
+      (should (member "Authorization: Bot TK" cmd)))))
+
+(ert-deftest asb-discord-bot-post-async-targets-thread ()
+  (let ((cmd nil)
+        (agent-shell-bridge-discord-bot-token "TK"))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (setq cmd (plist-get args :command)) 'proc)))
+      (agent-shell-bridge-discord--bot-post-async "thread-9" "hi"))
+    (should (member "POST" cmd))
+    (should (seq-some (lambda (s)
+                        (string-suffix-p "/channels/thread-9/messages" s))
+                      cmd))))
+
+(ert-deftest asb-discord-bot-edit-targets-thread-message ()
+  (let ((cmd nil)
+        (agent-shell-bridge-discord-bot-token "TK"))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (setq cmd (plist-get args :command)) 'proc)))
+      (agent-shell-bridge-discord--bot-edit-async "thread-7" "m-1" "x"))
+    (should (member "PATCH" cmd))
+    (should (seq-some (lambda (s)
+                        (string-suffix-p "/channels/thread-7/messages/m-1" s))
+                      cmd))))
+
+(ert-deftest asb-discord-bot-post-sync-returns-id-and-targets-thread ()
+  (let* ((calls nil)
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path body)
+            (push (list method path body) calls)
+            '((id . "posted-1")))))
+    (let ((id (agent-shell-bridge-discord--bot-post-sync "thread-3" "hi")))
+      (should (equal id "posted-1"))
+      (let ((call (car calls)))
+        (should (equal (nth 0 call) "POST"))
+        (should (equal (nth 1 call) "/channels/thread-3/messages"))
+        (should (equal (alist-get 'content (nth 2 call)) "hi"))))))
 
 (ert-deftest asb-discord-send-file-part-uploads ()
   ;; A message carrying a file part (e.g. /transcript) uploads as an attachment.
   (let* ((captured nil)
-         (agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord-bot-token "TK")
+         (agent-shell-bridge-discord-channel-id "chan-1")
          (agent-shell-bridge-discord--upload-fn
-          (lambda (url name data) (setq captured (list url name data)))))
+          (lambda (thread name data) (setq captured (list thread name data)))))
     (agent-shell-bridge-discord--send
      (agent-shell-bridge-make-message
       :role 'system :status 'complete
@@ -201,10 +243,10 @@ the same apply-spread class of bug that silently dropped bot reactions."
 (ert-deftest asb-discord-permission-adds-tappable-reactions ()
   (with-temp-buffer
     (let* ((reacts nil)
-           (agent-shell-bridge-discord-webhook-url "https://hook")
-           (agent-shell-bridge-discord--post-fn (lambda (_u _c) "perm-1"))
+           (agent-shell-bridge-discord-bot-token "TK")
+           (agent-shell-bridge-discord--post-fn (lambda (_thread _c) "perm-1"))
            (agent-shell-bridge-discord--react-fn
-            (lambda (_t id emoji) (push (cons id emoji) reacts))))
+            (lambda (_thread id emoji) (push (cons id emoji) reacts))))
       (setq-local agent-shell-bridge--session-handle "thread-1")
       (should (equal (agent-shell-bridge-discord--send
                       (agent-shell-bridge-make-message
@@ -224,86 +266,78 @@ the same apply-spread class of bug that silently dropped bot reactions."
     (should (string-match-p "rm -rf /" out))
     (should (string-match-p "✅ to allow" out))))
 
-(ert-deftest asb-discord-edit-url-threads-and-targets-message ()
-  (let ((agent-shell-bridge-discord-webhook-url "https://hook"))
-    (should (equal (agent-shell-bridge-discord--edit-url "m-1")
-                   "https://hook/messages/m-1"))
-    (with-temp-buffer
-      (setq-local agent-shell-bridge--session-handle "thread-7")
-      (should (equal (agent-shell-bridge-discord--edit-url "m-1")
-                     "https://hook/messages/m-1?thread_id=thread-7")))))
-
-(ert-deftest asb-discord-send-errors-without-webhook-url ()
-  (let ((agent-shell-bridge-discord-webhook-url nil))
+(ert-deftest asb-discord-send-errors-without-bot-token ()
+  (let ((agent-shell-bridge-discord-bot-token nil))
     (should-error
      (agent-shell-bridge-discord--send
       (agent-shell-bridge-make-message
        :role 'agent :status 'complete
        :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi")))))))
 
-;;;; Forum: per-session posts
+;;;; Forum: per-session posts (bot thread creation)
 
-(ert-deftest asb-discord-create-post-uses-thread-name-and-returns-id ()
+(ert-deftest asb-discord-create-thread-posts-to-forum-and-returns-id ()
   (let* ((captured nil)
-         (agent-shell-bridge-discord-webhook-url "https://hook")
-         (agent-shell-bridge-discord--create-fn
-          (lambda (url json)
-            (setq captured (list url json))
-            "{\"id\":\"msg-1\",\"channel_id\":\"thread-1\"}")))
-    (let ((id (agent-shell-bridge-discord--create-post "Refactor the parser")))
+         (agent-shell-bridge-discord-channel-id "forum-42")
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (method path body)
+            (setq captured (list method path body))
+            '((id . "thread-1")))))
+    (let ((id (agent-shell-bridge-discord--create-thread "Refactor the parser")))
       (should (equal id "thread-1"))
-      (should (string-match-p "wait=true" (nth 0 captured)))
-      (should (string-match-p "thread_name" (nth 1 captured)))
-      (should (string-match-p "Refactor the parser" (nth 1 captured))))))
+      (should (equal (nth 0 captured) "POST"))
+      (should (equal (nth 1 captured) "/channels/forum-42/threads"))
+      (should (equal (alist-get 'name (nth 2 captured)) "Refactor the parser"))
+      ;; a starter message is required to open a forum thread
+      (should (alist-get 'message (nth 2 captured))))))
 
-(ert-deftest asb-discord-create-post-truncates-title-to-100 ()
-  (let* ((agent-shell-bridge-discord-webhook-url "https://hook")
-         (long (make-string 250 ?a))
+(ert-deftest asb-discord-create-thread-truncates-title-to-100 ()
+  (let* ((long (make-string 250 ?a))
+         (agent-shell-bridge-discord-channel-id "forum-42")
          (seen nil)
-         (agent-shell-bridge-discord--create-fn
-          (lambda (_url json) (setq seen json) "{\"channel_id\":\"t\"}")))
-    (agent-shell-bridge-discord--create-post long)
-    (let ((name (alist-get 'thread_name
-                           (json-parse-string
-                            (progn (string-match "{.*}" seen) (match-string 0 seen))
-                            :object-type 'alist))))
-      (should (<= (length name) 100)))))
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (_m _p body) (setq seen body) '((id . "t")))))
+    (agent-shell-bridge-discord--create-thread long)
+    (should (<= (length (alist-get 'name seen)) 100))))
 
 (ert-deftest asb-discord-send-threads-under-session-post ()
-  (let* ((url nil)
-         (agent-shell-bridge-discord-webhook-url "https://hook")
+  (let* ((thread nil)
+         (agent-shell-bridge-discord-bot-token "TK")
          (agent-shell-bridge-discord--post-async-fn
-          (lambda (u _content) (setq url u))))
+          (lambda (th _content) (setq thread th))))
     (with-temp-buffer
       (setq-local agent-shell-bridge--session-handle "thread-9")
       (agent-shell-bridge-discord--send
        (agent-shell-bridge-make-message
         :role 'agent :status 'complete
         :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi")))))
-    (should (equal url "https://hook?thread_id=thread-9&wait=true"))))
+    (should (equal thread "thread-9"))))
 
 (ert-deftest asb-discord-send-flat-without-session-handle ()
-  (let* ((url nil)
-         (agent-shell-bridge-discord-webhook-url "https://hook")
+  (let* ((thread nil)
+         (agent-shell-bridge-discord-bot-token "TK")
+         (agent-shell-bridge-discord-channel-id "chan-root")
          (agent-shell-bridge-discord--post-async-fn
-          (lambda (u _content) (setq url u))))
-    ;; no session handle bound -> post to channel root
+          (lambda (th _content) (setq thread th))))
+    ;; no session handle bound -> post to the configured channel
     (agent-shell-bridge-discord--send
      (agent-shell-bridge-make-message
       :role 'agent :status 'complete
       :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
-    (should (equal url "https://hook?wait=true"))))
+    (should (equal thread "chan-root"))))
 
 (ert-deftest asb-discord-start-session-flat-when-not-forum ()
   (let ((agent-shell-bridge-discord-forum-p nil))
     (should (eq (agent-shell-bridge-discord--start-session '(:name "x"))
-                'discord-webhook))))
+                'discord))))
 
-(ert-deftest asb-discord-provider-registers-and-activates ()
-  (agent-shell-bridge-discord-webhook-register)
-  (should (eq (agent-shell-bridge-provider-name
-               (agent-shell-bridge-active-provider))
-              'discord-webhook)))
+(ert-deftest asb-discord-start-session-creates-forum-post ()
+  (let ((agent-shell-bridge-discord-forum-p t)
+        (agent-shell-bridge-discord-channel-id "forum-42")
+        (agent-shell-bridge-discord--rest-fn
+         (lambda (_m _p _b) '((id . "thread-77")))))
+    (should (equal (agent-shell-bridge-discord--start-session '(:title "hello"))
+                   "thread-77"))))
 
 (provide 'agent-shell-bridge-discord-test)
 ;;; agent-shell-bridge-discord-test.el ends here
