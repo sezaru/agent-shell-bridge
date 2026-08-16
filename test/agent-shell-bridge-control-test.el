@@ -232,5 +232,22 @@
             (should (equal injected "do X"))))
         (remhash "s" agent-shell-bridge--session->buffer)))))
 
+(ert-deftest asb-dispatch-inbound-inject-error-refuses ()
+  ;; A throwing inject must not propagate: dispatch returns a result so the
+  ;; caller can still mark the message (else a later resume rejects the
+  ;; already-handled message as offline backlog).
+  (with-temp-buffer
+    (let ((buf (current-buffer)))
+      (puthash "s" buf agent-shell-bridge--session->buffer)
+      (cl-letf (((symbol-function 'agent-shell-bridge--buffer-busy-p)
+                 (lambda (_b) nil))
+                ((symbol-function 'agent-shell-bridge-inject)
+                 (lambda (&rest _) (error "boom")))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (let ((res (agent-shell-bridge--dispatch-inbound
+                    (list :text "do X" :session "s"))))
+          (should (eq (plist-get res :status) 'refused))))
+      (remhash "s" agent-shell-bridge--session->buffer))))
+
 (provide 'agent-shell-bridge-control-test)
 ;;; agent-shell-bridge-control-test.el ends here

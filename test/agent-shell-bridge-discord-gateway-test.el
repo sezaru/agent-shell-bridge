@@ -109,26 +109,30 @@
     (should (member "-d" (agent-shell-bridge-discord--rest-args
                           "POST" "/x" '((content . "hi")))))))
 
-(ert-deftest asb-gw-rest-put-passes-command-as-a-list ()
-  "Regression (fa1b217): PUT/DELETE fire via make-process and its :command
-MUST be the full curl list.  The old code `apply'd it, spreading curl's
-flags into make-process keyword slots so the request silently never fired
-and no bot reaction ever appeared."
-  (let ((agent-shell-bridge-discord-bot-token "TK")
-        (captured nil) (calls 0))
+(ert-deftest asb-gw-rest-put-is-synchronous ()
+  "Reactions (PUT/DELETE) run synchronously via call-process -- never
+fire-and-forget make-process -- so a failed reaction is not silent."
+  (let ((agent-shell-bridge-discord-bot-token "TK") (made nil) (ran nil))
     (cl-letf (((symbol-function 'make-process)
-               (lambda (&rest args) (setq captured args) (cl-incf calls) 'proc)))
+               (lambda (&rest _) (setq made t) 'proc))
+              ((symbol-function 'call-process)
+               (lambda (&rest _) (setq ran t) 0)))
       (agent-shell-bridge-discord--rest-request
        "PUT" "/channels/c/messages/m/reactions/x/@me" nil))
-    (should (= calls 1))
-    (let ((command (plist-get captured :command)))
-      (should (listp command))                     ; not the bare string "curl"
-      (should (equal (car command) "curl"))
-      (should (member "PUT" command))
-      (should (seq-every-p #'stringp command)))
-    ;; the arg plist must be well-formed: every key is a keyword.  Under the
-    ;; apply-spread bug, curl flag strings ("-s", "-X", …) land in key slots.
-    (should (cl-loop for (k _v) on captured by #'cddr always (keywordp k)))))
+    (should ran)
+    (should (null made))))
+
+(ert-deftest asb-gw-rest-logs-discord-error-body ()
+  "A Discord error response (message + code) is surfaced via `message',
+so a rejected reaction never fails silently again."
+  (let ((agent-shell-bridge-discord-bot-token "TK") (logged nil))
+    (cl-letf (((symbol-function 'call-process)
+               (lambda (&rest _)
+                 (insert "{\"message\":\"Missing Access\",\"code\":50001}") 0))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args) (setq logged (apply #'format fmt args)))))
+      (agent-shell-bridge-discord--rest-request "PUT" "/x" nil))
+    (should (string-match-p "Missing Access" logged))))
 
 (ert-deftest asb-gw-rest-get-is-synchronous-and-parses ()
   "GET/POST run synchronously (never make-process) and return parsed JSON."

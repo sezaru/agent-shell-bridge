@@ -580,8 +580,16 @@ idle and refuses when busy (it never queues)."
      ((agent-shell-bridge--buffer-busy-p buffer)
       (list :status 'refused :reason 'busy))
      (t
-      (agent-shell-bridge-inject text buffer)
-      (list :status 'consumed)))))
+      ;; Inject must never throw past here: a live message that fails to
+      ;; return a result leaves the caller unable to mark it, so a later
+      ;; resume mistakes the already-handled message for offline backlog
+      ;; and rejects it.
+      (condition-case err
+          (progn (agent-shell-bridge-inject text buffer)
+                 (list :status 'consumed))
+        (error
+         (message "agent-shell-bridge: inject failed: %S" err)
+         (list :status 'refused)))))))
 
 ;;; Permission requests mirrored to the remote await a control action.
 

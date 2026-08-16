@@ -76,7 +76,7 @@ it survives, yielding one blank line of separation.")
 (defun agent-shell-bridge-discord--rest-args (method path body)
   "The curl argument list (after \"curl\") for METHOD PATH with BODY."
   (append
-   (list "-s" "-X" method
+   (list "-s" "--max-time" "10" "-X" method
          "-H" (format "Authorization: Bot %s" agent-shell-bridge-discord-bot-token)
          "-H" "Content-Type: application/json")
    (when body (list "-d" (json-encode body)))
@@ -84,24 +84,21 @@ it survives, yielding one blank line of separation.")
 
 (defun agent-shell-bridge-discord--rest-request (method path body)
   "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
-Reactions and status swaps (PUT/DELETE) fire-and-forget so the UI thread
-never blocks on them; GET/POST/PATCH run synchronously and return the
-decoded JSON response, or nil."
-  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
-    (if (member method '("PUT" "DELETE"))
-        (progn
-          ;; NB: `:command' must receive the list itself -- never `apply' the
-          ;; args here, or curl's flags get parsed as make-process keywords
-          ;; and the request silently never fires (breaking every reaction).
-          (ignore-errors
-            (make-process
-             :name "asb-discord-rest" :noquery t :buffer nil
-             :sentinel #'ignore :command (cons "curl" args)))
-          nil)
-      (let ((out (with-output-to-string
-                   (with-current-buffer standard-output
-                     (apply #'call-process "curl" nil t nil args)))))
-        (ignore-errors (json-parse-string out :object-type 'alist))))))
+Runs synchronously and returns the decoded JSON response, or nil for an
+empty 2xx body (e.g. a 204 from a reaction).  Reactions and status swaps
+go through here: running them synchronously -- and logging any Discord
+error body -- means a failed reaction surfaces instead of being silently
+fire-and-forgotten.  Ordinary message posts do NOT use this; they go
+through `agent-shell-bridge-discord--rest-async' to keep Enter snappy."
+  (let* ((args (agent-shell-bridge-discord--rest-args method path body))
+         (out (with-output-to-string
+                (with-current-buffer standard-output
+                  (apply #'call-process "curl" nil t nil args))))
+         (resp (ignore-errors (json-parse-string out :object-type 'alist))))
+    (when (and (listp resp) (alist-get 'code resp) (alist-get 'message resp))
+      (message "agent-shell-bridge: Discord %s %s failed: %s"
+               method path (alist-get 'message resp)))
+    resp))
 
 (defvar agent-shell-bridge-discord--rest-fn
   #'agent-shell-bridge-discord--rest-request
