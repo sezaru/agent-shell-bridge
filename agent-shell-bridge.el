@@ -381,23 +381,49 @@ ORIG-FN and ARGS are the advised call."
                 #'agent-shell-bridge--on-request)
     (setq agent-shell-bridge--advice-installed t)))
 
+(defvar-local agent-shell-bridge--turn-subscription nil
+  "Token for the buffer's `turn-complete' subscription.")
+
+(defun agent-shell-bridge--enable ()
+  (agent-shell-bridge--require-provider)
+  (agent-shell-bridge--install-advice)
+  (let* ((provider (agent-shell-bridge-active-provider))
+         (handle (funcall (agent-shell-bridge-provider-start-session provider)
+                          (list :name (buffer-name)))))
+    (setq agent-shell-bridge--session-handle handle)
+    (when handle
+      (puthash handle (current-buffer) agent-shell-bridge--session->buffer))
+    (funcall (agent-shell-bridge-provider-on-inbound provider)
+             #'agent-shell-bridge--dispatch-inbound)
+    (funcall (agent-shell-bridge-provider-on-control provider)
+             #'agent-shell-bridge-handle-control))
+  ;; A buffered stream (agent/thought chunks on a non-editing provider) must
+  ;; be flushed when the turn ends, else a tool-less reply never posts.
+  (when (fboundp 'agent-shell-subscribe-to)
+    (let ((buf (current-buffer)))
+      (setq agent-shell-bridge--turn-subscription
+            (agent-shell-subscribe-to
+             :shell-buffer buf
+             :event 'turn-complete
+             :on-event (lambda (_event)
+                         (when (buffer-live-p buf)
+                           (with-current-buffer buf
+                             (agent-shell-bridge--flush-stream)))))))))
+
+(defun agent-shell-bridge--disable ()
+  (agent-shell-bridge--flush-stream)
+  (when (and agent-shell-bridge--turn-subscription
+             (fboundp 'agent-shell-unsubscribe))
+    (agent-shell-unsubscribe :subscription agent-shell-bridge--turn-subscription)
+    (setq agent-shell-bridge--turn-subscription nil)))
+
 ;;;###autoload
 (define-minor-mode agent-shell-bridge-mode
   "Mirror this agent-shell buffer to the active bridge provider."
   :lighter " Bridge"
-  (when agent-shell-bridge-mode
-    (agent-shell-bridge--require-provider)
-    (agent-shell-bridge--install-advice)
-    (let* ((provider (agent-shell-bridge-active-provider))
-           (handle (funcall (agent-shell-bridge-provider-start-session provider)
-                            (list :name (buffer-name)))))
-      (setq agent-shell-bridge--session-handle handle)
-      (when handle
-        (puthash handle (current-buffer) agent-shell-bridge--session->buffer))
-      (funcall (agent-shell-bridge-provider-on-inbound provider)
-               #'agent-shell-bridge--dispatch-inbound)
-      (funcall (agent-shell-bridge-provider-on-control provider)
-               #'agent-shell-bridge-handle-control))))
+  (if agent-shell-bridge-mode
+      (agent-shell-bridge--enable)
+    (agent-shell-bridge--disable)))
 
 (provide 'agent-shell-bridge)
 ;;; agent-shell-bridge.el ends here
