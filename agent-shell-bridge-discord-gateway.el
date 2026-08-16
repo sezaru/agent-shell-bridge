@@ -189,25 +189,30 @@ Return a keyword describing the event so the live loop can react:
 
 ;;;; REST transport
 
+(defun agent-shell-bridge-discord--rest-args (method path body)
+  "The curl argument list (after \"curl\") for METHOD PATH with BODY."
+  (append
+   (list "-s" "-X" method
+         "-H" (format "Authorization: Bot %s" agent-shell-bridge-discord-bot-token)
+         "-H" "Content-Type: application/json")
+   (when body (list "-d" (json-encode body)))
+   (list (concat agent-shell-bridge-discord--api-base path))))
+
 (defun agent-shell-bridge-discord--rest-request (method path body)
   "Perform a Discord REST request: METHOD PATH with BODY alist (or nil).
 Reactions and status swaps (PUT/DELETE) fire-and-forget so the UI thread
 never blocks on them; GET/POST run synchronously and return the decoded
 JSON response, or nil."
-  (let* ((url (concat agent-shell-bridge-discord--api-base path))
-         (args (append
-                (list "-s" "-X" method
-                      "-H" (format "Authorization: Bot %s"
-                                   agent-shell-bridge-discord-bot-token)
-                      "-H" "Content-Type: application/json")
-                (when body (list "-d" (json-encode body)))
-                (list url))))
+  (let ((args (agent-shell-bridge-discord--rest-args method path body)))
     (if (member method '("PUT" "DELETE"))
         (progn
+          ;; NB: `:command' must receive the list itself -- never `apply' the
+          ;; args here, or curl's flags get parsed as make-process keywords
+          ;; and the request silently never fires (breaking every reaction).
           (ignore-errors
-            (apply #'make-process
-                   :name "asb-discord-rest" :noquery t :buffer nil
-                   :sentinel #'ignore :command (cons "curl" args)))
+            (make-process
+             :name "asb-discord-rest" :noquery t :buffer nil
+             :sentinel #'ignore :command (cons "curl" args)))
           nil)
       (let ((out (with-output-to-string
                    (with-current-buffer standard-output

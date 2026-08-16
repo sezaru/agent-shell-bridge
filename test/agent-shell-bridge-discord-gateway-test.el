@@ -96,6 +96,19 @@
     (should (eq (plist-get got :action) 'approve))
     (should (equal (plist-get got :target) "m-1"))))
 
+;;;; REST args (a flat string list so make-process's :command is valid)
+
+(ert-deftest asb-gw-rest-args-are-a-flat-string-list ()
+  (let* ((agent-shell-bridge-discord-bot-token "TK")
+         (args (agent-shell-bridge-discord--rest-args
+                "PUT" "/channels/c/messages/m/reactions/x/@me" nil)))
+    (should (seq-every-p #'stringp args))          ; (cons "curl" args) is a valid :command
+    (should (member "PUT" args))
+    (should (member "Authorization: Bot TK" args))
+    (should (string-suffix-p "/@me" (car (last args))))
+    (should (member "-d" (agent-shell-bridge-discord--rest-args
+                          "POST" "/x" '((content . "hi")))))))
+
 ;;;; REST send/edit (stubbed transport)
 
 (ert-deftest asb-gw-send-posts-message-and-returns-id ()
