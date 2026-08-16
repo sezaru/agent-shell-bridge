@@ -167,6 +167,16 @@ UPDATE is the value of (params update) in an ACP session notification."
             (agent-shell-bridge--require-provider))
            message))
 
+(defvar agent-shell-bridge--session-handle) ; defined buffer-local below
+
+(defun agent-shell-bridge--set-status (running)
+  "Reflect this session's turn as RUNNING or idle on the provider."
+  (let* ((provider (agent-shell-bridge-active-provider))
+         (fn (and provider (agent-shell-bridge-provider-set-status provider))))
+    (when fn
+      (ignore-errors
+        (funcall fn agent-shell-bridge--session-handle running)))))
+
 (defun agent-shell-bridge--edit (remote-id message)
   "Edit REMOTE-ID to MESSAGE via the active provider."
   (funcall (agent-shell-bridge-provider-edit
@@ -420,6 +430,7 @@ user message.  ORIG-FN and ARGS are the advised call."
         (unless agent-shell-bridge--session-started
           (setq agent-shell-bridge--session-title prompt))
         (agent-shell-bridge--ensure-session agent-shell-bridge--session-title)
+        (agent-shell-bridge--set-status t)
         ;; A prompt injected from the remote is already visible there.
         (unless agent-shell-bridge--from-remote
           (agent-shell-bridge--flush-stream)
@@ -494,7 +505,8 @@ ORIG-FN and ARGS are the advised call."
              :on-event (lambda (_event)
                          (when (buffer-live-p buf)
                            (with-current-buffer buf
-                             (agent-shell-bridge--flush-stream)))))))))
+                             (agent-shell-bridge--flush-stream)
+                             (agent-shell-bridge--set-status nil)))))))))
 
 (defun agent-shell-bridge--disable ()
   (agent-shell-bridge--flush-stream)

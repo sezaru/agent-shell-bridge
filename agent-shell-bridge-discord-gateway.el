@@ -40,7 +40,12 @@
   :group 'agent-shell-bridge)
 
 (defcustom agent-shell-bridge-discord-channel-id nil
-  "Discord channel id the session mirrors to and listens on."
+  "Discord forum channel id the sessions post under and the bot listens on."
+  :type '(choice (const nil) string)
+  :group 'agent-shell-bridge)
+
+(defcustom agent-shell-bridge-discord-guild-id nil
+  "Discord server (guild) id, used to enumerate active forum posts."
   :type '(choice (const nil) string)
   :group 'agent-shell-bridge)
 
@@ -140,7 +145,11 @@ Ignores the bot's own messages and empty content."
          (action (agent-shell-bridge-discord--reaction-action emoji))
          (msg-id (alist-get 'message_id d))
          (cb (agent-shell-bridge-discord-gateway-on-control gw)))
-    (when (and cb action)
+    ;; Ignore the bot's own marker reactions (✅/❌ it adds to user messages)
+    ;; -- only a human's reaction is a control.
+    (when (and cb action
+               (not (equal (alist-get 'user_id d)
+                           (agent-shell-bridge-discord-gateway-bot-user-id gw))))
       (funcall cb (list :action action :target msg-id
                         :session (alist-get 'channel_id d))))))
 
@@ -314,11 +323,29 @@ consumed and must not be injected into a conversation that moved on."
       (agent-shell-bridge-discord--mark channel-id (alist-get 'id m) nil))
     stale))
 
+(defun agent-shell-bridge-discord--forum-threads ()
+  "Return active thread ids of posts under the configured forum channel."
+  (let ((resp (agent-shell-bridge-discord--rest
+               "GET" (format "/guilds/%s/threads/active"
+                             agent-shell-bridge-discord-guild-id))))
+    (seq-map (lambda (th) (alist-get 'id th))
+             (seq-filter
+              (lambda (th) (equal (alist-get 'parent_id th)
+                                  agent-shell-bridge-discord-channel-id))
+              (append (alist-get 'threads resp) nil)))))
+
+(defun agent-shell-bridge-discord--sweep-forum ()
+  "Reject unprocessed (offline-backlog) user messages across all forum posts."
+  (dolist (thread (agent-shell-bridge-discord--forum-threads))
+    (ignore-errors (agent-shell-bridge-discord--reject-stale thread))))
+
 ;;;; Live connection (guarded; not unit tested)
 
 (defvar agent-shell-bridge-discord--gw nil
   "The active gateway session struct.")
 (defvar agent-shell-bridge-discord--heartbeat-timer nil)
+(defvar agent-shell-bridge-discord--swept nil
+  "Non-nil once the offline-backlog sweep ran this Emacs session.")
 
 (defun agent-shell-bridge-discord--gw-send-json (gw payload)
   (websocket-send-text (agent-shell-bridge-discord-gateway-socket gw)
@@ -348,6 +375,13 @@ consumed and must not be injected into a conversation that moved on."
           gw (agent-shell-bridge-discord--identify-payload
               (agent-shell-bridge-discord-gateway-token gw)
               (agent-shell-bridge-discord-gateway-intents gw))))
+        (:dispatch
+         ;; First READY of this Emacs session: reject anything typed while
+         ;; the bot was offline before we started listening live.
+         (when (and (equal (alist-get 't event) "READY")
+                    (not agent-shell-bridge-discord--swept))
+           (setq agent-shell-bridge-discord--swept t)
+           (ignore-errors (agent-shell-bridge-discord--sweep-forum))))
         (:reconnect (agent-shell-bridge-discord-gateway-connect))
         (:invalid-session (agent-shell-bridge-discord-gateway-connect))))))
 
@@ -412,6 +446,43 @@ consumed and must not be injected into a conversation that moved on."
   (agent-shell-bridge-register-provider
    (agent-shell-bridge-discord-gateway-provider))
   (agent-shell-bridge-set-provider 'discord-gateway))
+
+;;;; Hybrid provider: webhook out (forum posts) + gateway in (listen/react)
+
+(defun agent-shell-bridge-discord--store-inbound (cb)
+  (when agent-shell-bridge-discord--gw
+    (setf (agent-shell-bridge-discord-gateway-on-inbound
+           agent-shell-bridge-discord--gw) cb)))
+
+(defun agent-shell-bridge-discord--store-control (cb)
+  (when agent-shell-bridge-discord--gw
+    (setf (agent-shell-bridge-discord-gateway-on-control
+           agent-shell-bridge-discord--gw) cb)))
+
+(defun agent-shell-bridge-discord-provider ()
+  "Return the hybrid Discord provider: webhook output, gateway listener."
+  (agent-shell-bridge-provider-create
+   :name 'discord
+   :can-edit nil                        ; webhook out: buffer + post on complete
+   :start-session #'agent-shell-bridge-discord--start-session
+   :send #'agent-shell-bridge-discord--send
+   :edit #'ignore
+   :delete #'ignore
+   :on-inbound #'agent-shell-bridge-discord--store-inbound
+   :on-control #'agent-shell-bridge-discord--store-control
+   :set-status (lambda (handle running)
+                 (when (stringp handle)
+                   (agent-shell-bridge-discord--set-status handle running)))
+   :stop #'agent-shell-bridge-discord-gateway--stop))
+
+;;;###autoload
+(defun agent-shell-bridge-discord-register ()
+  "Register + select the hybrid provider and connect the bot listener."
+  (interactive)
+  (agent-shell-bridge-register-provider (agent-shell-bridge-discord-provider))
+  (agent-shell-bridge-set-provider 'discord)
+  (when (and agent-shell-bridge-discord-bot-token (featurep 'websocket))
+    (ignore-errors (agent-shell-bridge-discord-gateway-connect))))
 
 (provide 'agent-shell-bridge-discord-gateway)
 ;;; agent-shell-bridge-discord-gateway.el ends here

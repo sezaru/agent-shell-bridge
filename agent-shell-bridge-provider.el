@@ -39,6 +39,8 @@
   on-inbound
   ;; (callback): callback receives (:action SYM :target ID :session HANDLE)
   on-control
+  ;; (session-handle running) -> nil : reflect turn running/idle (optional)
+  set-status
   ;; () -> nil
   stop)
 

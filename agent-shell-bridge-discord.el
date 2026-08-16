@@ -121,16 +121,25 @@ truncated with a marker."
 ;;;; Transport
 
 (defun agent-shell-bridge-discord--curl-post (url content)
-  "POST CONTENT as a Discord message to webhook URL via curl."
-  (let ((json (json-encode `(("content" . ,content)))))
-    (call-process "curl" nil nil nil
-                  "-s" "-X" "POST"
-                  "-H" "Content-Type: application/json"
-                  "-d" json url)))
+  "POST CONTENT to webhook URL via curl; return the created message id."
+  (let* ((json (json-encode `(("content" . ,content))))
+         (out (with-output-to-string
+                (with-current-buffer standard-output
+                  (call-process "curl" nil t nil
+                                "-s" "-X" "POST"
+                                "-H" "Content-Type: application/json"
+                                "-d" json url))))
+         (data (ignore-errors (json-parse-string out :object-type 'alist))))
+    (alist-get 'id data)))
 
 (defvar agent-shell-bridge-discord--post-fn
   #'agent-shell-bridge-discord--curl-post
-  "Function of (URL CONTENT) that performs the POST.  Rebound in tests.")
+  "Function of (URL CONTENT) that POSTs and returns the message id.
+Rebound in tests.")
+
+(defun agent-shell-bridge-discord--with-wait (url)
+  "Append the wait=true query param to URL so the POST returns the message."
+  (concat url (if (string-search "?" url) "&" "?") "wait=true"))
 
 (defun agent-shell-bridge-discord--session-thread ()
   "The current buffer's forum thread id, if any."
@@ -144,13 +153,13 @@ When the session opened a forum post, thread the message under it."
   (unless agent-shell-bridge-discord-webhook-url
     (error "agent-shell-bridge-discord-webhook-url is not set"))
   (let* ((thread (agent-shell-bridge-discord--session-thread))
-         (url (if thread
-                  (format "%s?thread_id=%s"
-                          agent-shell-bridge-discord-webhook-url thread)
-                agent-shell-bridge-discord-webhook-url)))
+         (url (agent-shell-bridge-discord--with-wait
+               (if thread
+                   (format "%s?thread_id=%s"
+                           agent-shell-bridge-discord-webhook-url thread)
+                 agent-shell-bridge-discord-webhook-url))))
     (funcall agent-shell-bridge-discord--post-fn
-             url (agent-shell-bridge-discord--flatten message)))
-  nil)
+             url (agent-shell-bridge-discord--flatten message))))
 
 ;;; Forum: one post per session
 

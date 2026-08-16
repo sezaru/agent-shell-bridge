@@ -72,7 +72,7 @@
      (agent-shell-bridge-make-message
       :role 'agent :status 'complete
       :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
-    (should (equal (nth 0 captured) "https://example.test/hook"))
+    (should (equal (nth 0 captured) "https://example.test/hook?wait=true"))
     (should (equal (nth 1 captured) "🤖 **Agent**\nhi"))))
 
 (ert-deftest asb-discord-send-errors-without-webhook-url ()
@@ -122,7 +122,7 @@
        (agent-shell-bridge-make-message
         :role 'agent :status 'complete
         :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi")))))
-    (should (equal url "https://hook?thread_id=thread-9"))))
+    (should (equal url "https://hook?thread_id=thread-9&wait=true"))))
 
 (ert-deftest asb-discord-send-flat-without-session-handle ()
   (let* ((url nil)
@@ -134,7 +134,18 @@
      (agent-shell-bridge-make-message
       :role 'agent :status 'complete
       :parts (list (agent-shell-bridge-make-part :kind 'text :content "hi"))))
-    (should (equal url "https://hook"))))
+    (should (equal url "https://hook?wait=true"))))
+
+(ert-deftest asb-discord-send-returns-message-id ()
+  (let* ((agent-shell-bridge-discord-webhook-url "https://hook")
+         (agent-shell-bridge-discord--post-fn
+          (lambda (_u _c) "posted-42")))
+    (should (equal (agent-shell-bridge-discord--send
+                    (agent-shell-bridge-make-message
+                     :role 'agent :status 'complete
+                     :parts (list (agent-shell-bridge-make-part
+                                   :kind 'text :content "hi"))))
+                   "posted-42"))))
 
 (ert-deftest asb-discord-start-session-flat-when-not-forum ()
   (let ((agent-shell-bridge-discord-forum-p nil))

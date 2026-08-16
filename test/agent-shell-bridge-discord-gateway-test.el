@@ -91,6 +91,7 @@
      gw '((op . 0) (t . "MESSAGE_REACTION_ADD")
           (d . ((message_id . "m-1")
                 (channel_id . "chan-1")
+                (user_id . "human-1")
                 (emoji . ((name . "✅")))))))
     (should (eq (plist-get got :action) 'approve))
     (should (equal (plist-get got :target) "m-1"))))
@@ -233,6 +234,32 @@
     (should (equal (nth 0 (nth 1 calls)) "PUT"))
     (should (string-match-p (url-hexify-string "🟢") (nth 1 (nth 1 calls))))
     (should (string-match-p "/messages/thread-1/" (nth 1 (nth 1 calls))))))
+
+(ert-deftest asb-gw-forum-threads-filters-by-parent ()
+  (let* ((agent-shell-bridge-discord-guild-id "g1")
+         (agent-shell-bridge-discord-channel-id "forum")
+         (agent-shell-bridge-discord--rest-fn
+          (lambda (_m _p _b)
+            '((threads . [((id . "t1") (parent_id . "forum"))
+                          ((id . "t2") (parent_id . "other"))
+                          ((id . "t3") (parent_id . "forum"))])))))
+    (should (equal (agent-shell-bridge-discord--forum-threads) '("t1" "t3")))))
+
+(ert-deftest asb-gw-reaction-ignores-bot-own ()
+  (let* ((fired nil)
+         (gw (agent-shell-bridge-discord-gateway-create
+              :bot-user-id "bot-99"
+              :on-control (lambda (ev) (setq fired ev)))))
+    ;; a reaction added by the bot itself must not be treated as a control
+    (agent-shell-bridge-discord--route-reaction
+     gw '((message_id . "m") (channel_id . "c")
+          (user_id . "bot-99") (emoji . ((name . "✅")))))
+    (should (null fired))
+    ;; a human reaction does fire
+    (agent-shell-bridge-discord--route-reaction
+     gw '((message_id . "m") (channel_id . "c")
+          (user_id . "human-1") (emoji . ((name . "✅")))))
+    (should (eq (plist-get fired :action) 'approve))))
 
 (provide 'agent-shell-bridge-discord-gateway-test)
 ;;; agent-shell-bridge-discord-gateway-test.el ends here
