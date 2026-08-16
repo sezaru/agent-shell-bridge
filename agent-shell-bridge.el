@@ -34,9 +34,9 @@
 
 ;;;; Trace logging
 
-(defcustom agent-shell-bridge-debug t
+(defcustom agent-shell-bridge-debug nil
   "When non-nil, write verbose trace lines to `*agent-shell-bridge-log*'.
-A debugging aid for the inbound/reaction path; turn off once stable."
+A debugging aid for the inbound/reaction path; set to t to trace."
   :type 'boolean
   :group 'agent-shell-bridge)
 
