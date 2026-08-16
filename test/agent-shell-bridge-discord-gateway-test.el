@@ -159,7 +159,7 @@ and no bot reaction ever appeared."
       (let ((call (car calls)))
         (should (equal (nth 0 call) "POST"))
         (should (equal (nth 1 call) "/channels/chan-1/messages"))
-        (should (equal (alist-get 'content (nth 2 call)) "🤖 **Agent** >\nhi"))))))
+        (should (equal (alist-get 'content (nth 2 call)) "🤖 **Agent >**\nhi"))))))
 
 (ert-deftest asb-gw-edit-patches-message ()
   (let* ((calls nil)

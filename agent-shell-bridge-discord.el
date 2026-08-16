@@ -154,10 +154,10 @@ response we do not need back."
 (defun agent-shell-bridge-discord--header (message)
   "Role header line for MESSAGE (agent/user/permission/system only)."
   (pcase (plist-get message :role)
-    ('agent "🤖 **Agent** >")
-    ('user "🧑 **User** >")
-    ('permission "⚠️ **Permission Required** >")
-    (_ "ℹ️ **System** >")))
+    ('agent "🤖 **Agent >**")
+    ('user "🧑 **User >**")
+    ('permission "⚠️ **Permission Required >**")
+    (_ "ℹ️ **System >**")))
 
 (defun agent-shell-bridge-discord--flatten (message &optional max-len)
   "Flatten a foreground MESSAGE (agent/user/permission/system) to a string.
