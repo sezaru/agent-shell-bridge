@@ -168,3 +168,28 @@ tappable ✅ / ❌ — tap one to allow or deny.
 Sessions persist across Emacs restarts: on resume, the bridge re-links the
 existing forum post (rather than opening a duplicate) and rejects any backlog
 typed while it was closed.
+
+## App provider (asb-sidecar)
+
+`agent-shell-bridge-app.el` mirrors sessions to the **`asb-sidecar`** daemon
+over its unix socket, so the phone app (`~/projects/asb-app`) is a first-class
+remote surface alongside Discord — end-to-end-encrypted and serverless via iroh.
+
+Enable it with `M-x agent-shell-bridge-app-register` (in place of the Discord
+registration), then turn on `agent-shell-bridge-mode` in an agent-shell buffer.
+It needs the daemon running:
+
+```sh
+asb-sidecar run          # resident daemon: Emacs socket + phone iroh server
+asb-sidecar pair         # pair a phone (stop the daemon first, one endpoint per identity)
+```
+
+The socket path is `agent-shell-bridge-app-socket` (default
+`$XDG_RUNTIME_DIR/asb.sock`). Mirroring degrades gracefully: if the daemon is
+down, sends are dropped and reconnect on the next message — agent-shell never
+blocks. It is a non-editing provider, so each answer, thought, tool call, and
+permission crosses the wire as one complete structured update; the phone does
+the collapsing.
+
+> v1 limitation: a permission `always`-allow from the phone degrades to
+> allow-once (the core's control path understands approve/deny/interrupt).
