@@ -63,13 +63,17 @@ Each entry is a cons (CID . OBJ). The sidecar link is treated as unreliable:
 a message is held here until the sidecar acks its CID (durably applied), not
 merely until it is written to the socket -- so a daemon that dies mid-write
 loses nothing, the un-acked entry is replayed on reconnect.")
-(defvar agent-shell-bridge-app--epoch
-  (format "%d-%d" (emacs-pid) (random (expt 2 31)))
-  "Process-unique token qualifying our monotonic CIDs. A fresh Emacs gets a
-fresh epoch, so the sidecar's per-epoch high-water never wrongly skips our
-restarted-from-1 CIDs.")
 (defvar agent-shell-bridge-app--cid 0
-  "Monotonic client-id counter within this epoch.")
+  "Monotonic client-id counter for the ack/outbox transport layer only.
+NOT a dedup key -- semantic dedup is the per-session `ord' (see `--ordinals').")
+(defvar agent-shell-bridge-app--ordinals (make-hash-table :test 'equal)
+  "Per-session (handle -> u64) monotonic phrase ordinal: the daemon's dedup key.
+Seeded from the daemon's persisted high-water on `session-hw', reset to 0 at the
+start of a `session/load' replay so the replay reproduces the original 1..N
+ordinals (deduped), then continued so genuinely-new phrases append past N.")
+(defvar agent-shell-bridge-app--replaying (make-hash-table :test 'equal)
+  "Per-session (handle -> t) flag: a `session/load' replay is in progress, used
+to fire the ordinal reset exactly once on the replay's leading edge.")
 (defvar agent-shell-bridge-app--inflight nil
   "CIDs already written on the *current* connection (so a live pump does not
 resend them). Cleared on every fresh connection, forcing a full replay.")
@@ -159,6 +163,37 @@ A resume gate must not hang Emacs, so a silent daemon lets the resume proceed."
                  (cons 'content (agent-shell-bridge-app--encode-content message))))))
       (_ nil))))
 
+;;;; Per-session ordinal (the daemon's dedup key)
+
+(defun agent-shell-bridge-app--session-loading-p (handle)
+  "Non-nil when HANDLE's agent-shell buffer is mid `session/load' (history
+replay).  Reads agent-shell's `--state' `:active-requests', an alist of
+in-flight requests each carrying a `:method'."
+  (let ((buf (and (boundp 'agent-shell-bridge--session->buffer)
+                  (gethash handle agent-shell-bridge--session->buffer))))
+    (and (buffer-live-p buf)
+         (with-current-buffer buf
+           (and (boundp 'agent-shell--state)
+                (seq-find (lambda (r)
+                            (equal (map-elt r :method) "session/load"))
+                          (map-elt agent-shell--state :active-requests))
+                t)))))
+
+(defun agent-shell-bridge-app--next-ord (handle)
+  "Assign HANDLE's next per-session ordinal, handling the replay edge.
+On the first phrase of a `session/load' replay, reset to 0 so the replay
+reproduces the original 1..N ordinals (the daemon dedups them); afterwards the
+counter continues, so new phrases append past the high-water."
+  (let ((loading (agent-shell-bridge-app--session-loading-p handle)))
+    (cond
+     ((and loading (not (gethash handle agent-shell-bridge-app--replaying)))
+      (puthash handle 0 agent-shell-bridge-app--ordinals)
+      (puthash handle t agent-shell-bridge-app--replaying))
+     ((not loading)
+      (remhash handle agent-shell-bridge-app--replaying)))
+    (puthash handle (1+ (gethash handle agent-shell-bridge-app--ordinals 0))
+             agent-shell-bridge-app--ordinals)))
+
 ;;;; Line encoding + permission mapping
 
 (defun agent-shell-bridge-app--line (obj)
@@ -206,6 +241,14 @@ A resume gate must not hang Emacs, so a silent daemon lets the resume proceed."
       ("claim-result"
        (push (cons (alist-get 'cid obj) (eq (alist-get 'granted obj) t))
              agent-shell-bridge-app--claim-results))
+      ("session-hw"
+       ;; Seed a still-untouched per-session counter to the daemon's high-water
+       ;; (resume-without-replay). Once any phrase (live or replayed) has
+       ;; advanced it, a late/duplicate hw must not clobber that progress.
+       (let ((h (alist-get 'session obj)) (hw (alist-get 'hw obj)))
+         (when (and h (integerp hw)
+                    (= 0 (gethash h agent-shell-bridge-app--ordinals 0)))
+           (puthash h hw agent-shell-bridge-app--ordinals))))
       ("inject"
        (when inbound
          (funcall inbound (list :text (alist-get 'text obj) :session session))))
@@ -379,9 +422,7 @@ the next connection."
                   (progn
                     (process-send-string
                      proc (agent-shell-bridge-app--line
-                           (append obj
-                                   (list (cons 'cid cid)
-                                         (cons 'epoch agent-shell-bridge-app--epoch)))))
+                           (append obj (list (cons 'cid cid)))))
                     (push cid agent-shell-bridge-app--inflight))
                 (error
                  (agent-shell-bridge--log "app: send failed, will retry: %S" err)
@@ -423,6 +464,22 @@ the next connection."
              (cons 'title title))))
     handle))
 
+(defun agent-shell-bridge-app--on-relink (handle)
+  "Register a RESUMED session with the daemon (relink hook).
+On resume the core relinks to the persisted post without calling
+`start-session', so the daemon never learns the session and would reject its
+replayed `msg's as unknown.  Send `session-open' here so it registers and
+replies `session-hw' (seeding our ordinal counter).  No-op unless the app
+provider is the active one."
+  (when (eq (ignore-errors
+              (agent-shell-bridge-provider-name (agent-shell-bridge-active-provider)))
+            'app)
+    (cl-pushnew handle agent-shell-bridge-app--handles :test #'equal)
+    (setq agent-shell-bridge-app--last-handle handle)
+    (agent-shell-bridge-app--send-emacs-in
+     (list (cons 't "session-open") (cons 'session handle)
+           (cons 'title (agent-shell-bridge-app--title-for handle))))))
+
 (defun agent-shell-bridge-app--send (message)
   "Mirror MESSAGE to the sidecar; return a remote id."
   (let ((handle (or (plist-get message :session)
@@ -435,7 +492,9 @@ the next connection."
       (when-let* ((payload (agent-shell-bridge-app--payload message)))
         (agent-shell-bridge-app--send-emacs-in
          (list (cons 't "msg") (cons 'session handle)
-               (cons 'seq 0) (cons 'turn 0) (cons 'payload payload))))
+               (cons 'seq 0) (cons 'turn 0)
+               (cons 'ord (agent-shell-bridge-app--next-ord handle))
+               (cons 'payload payload))))
       (format "%d" (cl-incf agent-shell-bridge-app--counter)))))
 
 (defun agent-shell-bridge-app--set-status (handle running)
@@ -481,6 +540,8 @@ the connection up for the other sessions."
     (setq agent-shell-bridge-app--handles
           (delete handle agent-shell-bridge-app--handles))
     (setf (alist-get handle agent-shell-bridge-app--titles nil t #'equal) nil)
+    (remhash handle agent-shell-bridge-app--ordinals)
+    (remhash handle agent-shell-bridge-app--replaying)
     (when (equal agent-shell-bridge-app--last-handle handle)
       (setq agent-shell-bridge-app--last-handle
             (car agent-shell-bridge-app--handles)))))
@@ -491,6 +552,8 @@ the connection up for the other sessions."
      (list (cons 't "session-close") (cons 'session h))))
   (setq agent-shell-bridge-app--handles nil
         agent-shell-bridge-app--titles nil)
+  (clrhash agent-shell-bridge-app--ordinals)
+  (clrhash agent-shell-bridge-app--replaying)
   (when agent-shell-bridge-app--retry-timer
     (cancel-timer agent-shell-bridge-app--retry-timer)
     (setq agent-shell-bridge-app--retry-timer nil))
@@ -517,7 +580,11 @@ the connection up for the other sessions."
   "Register and select the asb-sidecar (app) provider."
   (interactive)
   (agent-shell-bridge-register-provider (agent-shell-bridge-app-provider))
-  (agent-shell-bridge-set-provider 'app))
+  (agent-shell-bridge-set-provider 'app)
+  ;; Register a resumed session with the daemon when the core relinks it
+  ;; (idempotent: add-hook de-dups on the same symbol).
+  (add-hook 'agent-shell-bridge--relink-functions
+            #'agent-shell-bridge-app--on-relink))
 
 (provide 'agent-shell-bridge-app)
 ;;; agent-shell-bridge-app.el ends here

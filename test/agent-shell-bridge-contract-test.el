@@ -57,8 +57,13 @@ A rename/removal here silently stops all mirroring.")
     agent-shell--config-option-set-mode-id
     agent-shell--config-option-set-model-id
     agent-shell--config-option-set-thought-level-id
-    agent-shell-start)                      ; session open/resume interception
-  "agent-shell internals the bridge calls directly.")
+    agent-shell-start                       ; session open/resume interception
+    agent-shell--active-requests-p          ; corroborates the :active-requests
+    agent-shell--send-request)              ;   / :method state shape we read
+  "agent-shell internals the bridge calls directly.
+The last two are not called but corroborate the `:active-requests' state shape
+the app provider reads to detect a `session/load' replay (the #24 ordinal
+reset) -- if they vanish, that read has almost certainly broken too.")
 
 (ert-deftest asb-contract/advised-functions-exist ()
   "Every advised agent-shell internal must still be defined."

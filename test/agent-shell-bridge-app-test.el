@@ -347,5 +347,89 @@
          (agent-shell-bridge-app-claim-timeout 0.3))
     (should (eq (agent-shell-bridge-app--claim-session "h") 'unavailable))))
 
+;;;; Task 24 — per-session ordinal (dedup key), seed + replay reset
+
+(ert-deftest asb-app-ordinal-live-sequence ()
+  "With no replay, a session's ordinals are a plain 1,2,3."
+  (let ((agent-shell-bridge-app--ordinals (make-hash-table :test 'equal))
+        (agent-shell-bridge-app--replaying (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'agent-shell-bridge-app--session-loading-p)
+               (lambda (_h) nil)))
+      (should (= 1 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 2 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 3 (agent-shell-bridge-app--next-ord "h"))))))
+
+(ert-deftest asb-app-session-hw-seeds-untouched-counter-only ()
+  "`session-hw' seeds a still-0 counter; a later hw never rewinds progress."
+  (let ((agent-shell-bridge-app--ordinals (make-hash-table :test 'equal))
+        (agent-shell-bridge-app--replaying (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'agent-shell-bridge-app--session-loading-p)
+               (lambda (_h) nil)))
+      ;; daemon reports high-water 5 -> resume-without-replay continues at 6
+      (agent-shell-bridge-app--handle '((t . "session-hw") (session . "h") (hw . 5))
+                                      nil nil)
+      (should (= 6 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 7 (agent-shell-bridge-app--next-ord "h")))
+      ;; a stray/duplicate hw must NOT clobber the advanced counter
+      (agent-shell-bridge-app--handle '((t . "session-hw") (session . "h") (hw . 99))
+                                      nil nil)
+      (should (= 8 (agent-shell-bridge-app--next-ord "h"))))))
+
+(ert-deftest asb-app-replay-reproduces-ordinals-then-heals-and-continues ()
+  "The whole #24 flow: seed high-water 3, a session/load replay resets and
+reproduces 1,2,3 (daemon dedups), a divergence-tail phrase gets 4 (appended),
+then live continues at 5."
+  (let ((agent-shell-bridge-app--ordinals (make-hash-table :test 'equal))
+        (agent-shell-bridge-app--replaying (make-hash-table :test 'equal))
+        (loading nil))
+    (cl-letf (((symbol-function 'agent-shell-bridge-app--session-loading-p)
+               (lambda (_h) loading)))
+      (agent-shell-bridge-app--handle '((t . "session-hw") (session . "h") (hw . 3))
+                                      nil nil)
+      (setq loading t)                  ; session/load replay begins
+      (should (= 1 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 2 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 3 (agent-shell-bridge-app--next-ord "h")))
+      (should (= 4 (agent-shell-bridge-app--next-ord "h")))  ; divergence tail
+      (setq loading nil)                ; replay ends
+      (should (= 5 (agent-shell-bridge-app--next-ord "h"))))))
+
+(ert-deftest asb-app-on-relink-registers-resumed-session ()
+  "The relink hook sends `session-open' (registering a resumed session) only
+when the app provider is active."
+  (let* ((sock (make-temp-name
+                (expand-file-name "asb-relink-" temporary-file-directory)))
+         (agent-shell-bridge-app-socket sock)
+         (lines nil) (server nil)
+         (agent-shell-bridge-app--proc nil)
+         (agent-shell-bridge-app--rx "")
+         (agent-shell-bridge-app--outbox nil)
+         (agent-shell-bridge-app--inflight nil)
+         (agent-shell-bridge-app--was-live nil)
+         (agent-shell-bridge-app--cid 0)
+         (agent-shell-bridge-app--handles nil)
+         (agent-shell-bridge-app--titles '(("h" . "Resumed"))))
+    (agent-shell-bridge-register-provider (agent-shell-bridge-app-provider))
+    (agent-shell-bridge-set-provider 'app)
+    (setq server
+          (make-network-process
+           :name "asb-relink-stub" :server t :family 'local :service sock
+           :filter (lambda (_p chunk)
+                     (dolist (l (split-string chunk "\n" t))
+                       (push (json-read-from-string l) lines)))))
+    (unwind-protect
+        (progn
+          (agent-shell-bridge-app--on-relink "h")
+          (asb-app-test--drain)
+          (should (member "h" agent-shell-bridge-app--handles))
+          (let ((open (seq-find (lambda (l) (equal (alist-get 't l) "session-open"))
+                                lines)))
+            (should open)
+            (should (equal (alist-get 'session open) "h"))
+            (should (equal (alist-get 'title open) "Resumed"))))
+      (ignore-errors (delete-process server))
+      (agent-shell-bridge-app--disconnect)
+      (ignore-errors (delete-file sock)))))
+
 (provide 'agent-shell-bridge-app-test)
 ;;; agent-shell-bridge-app-test.el ends here
