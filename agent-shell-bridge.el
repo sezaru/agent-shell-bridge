@@ -784,9 +784,25 @@ ORIG-FN and ARGS are the advised call."
 (defvar-local agent-shell-bridge--turn-subscription nil
   "Token for the buffer's `turn-complete' subscription.")
 
+(defun agent-shell-bridge--teardown-session ()
+  "Tell the provider this buffer's session closed (buffer killed/mode off).
+Drops the provider's per-session handle so the daemon's live-session
+ref-count falls; the daemon self-exits once the last buffer anywhere goes."
+  (when agent-shell-bridge--session-handle
+    (let* ((provider (agent-shell-bridge-active-provider))
+           (close (and provider (agent-shell-bridge-provider-close-session provider))))
+      (when close
+        (ignore-errors (funcall close agent-shell-bridge--session-handle)))
+      (remhash agent-shell-bridge--session-handle
+               agent-shell-bridge--session->buffer)
+      (setq agent-shell-bridge--session-handle nil
+            agent-shell-bridge--session-started nil))))
+
 (defun agent-shell-bridge--enable ()
   (agent-shell-bridge--require-provider)
   (agent-shell-bridge--install-advice)
+  ;; A killed buffer never re-runs the mode body, so free its session here.
+  (add-hook 'kill-buffer-hook #'agent-shell-bridge--teardown-session nil t)
   ;; A brand-new session opens its post lazily on the first prompt (so it
   ;; can be titled by it -- see `--on-send-command').  A RESUMED session
   ;; already has a persisted post: relink it now so inbound remote messages

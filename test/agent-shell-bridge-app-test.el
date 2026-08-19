@@ -243,5 +243,68 @@
       (agent-shell-bridge-app--disconnect)
       (ignore-errors (delete-file sock)))))
 
+(ert-deftest asb-app-close-session-sends-close-and-drops-handle ()
+  "Closing one handle emits a single `session-close' and forgets just it."
+  (let* ((sock (make-temp-name
+                (expand-file-name "asb-test-" temporary-file-directory)))
+         (agent-shell-bridge-app-socket sock)
+         (lines nil) (server nil)
+         (agent-shell-bridge-app--proc nil)
+         (agent-shell-bridge-app--rx "")
+         (agent-shell-bridge-app--outbox nil)
+         (agent-shell-bridge-app--inflight nil)
+         (agent-shell-bridge-app--was-live nil)
+         (agent-shell-bridge-app--cid 0)
+         (agent-shell-bridge-app--handles '("a" "b"))
+         (agent-shell-bridge-app--titles '(("a" . "A") ("b" . "B")))
+         (agent-shell-bridge-app--last-handle "b"))
+    (setq server
+          (make-network-process
+           :name "asb-stub-close" :server t :family 'local :service sock
+           :filter (lambda (_p chunk)
+                     (dolist (l (split-string chunk "\n" t))
+                       (push (json-read-from-string l) lines)))))
+    (unwind-protect
+        (progn
+          (agent-shell-bridge-app--close-session "b")
+          (asb-app-test--drain)
+          (let ((close (seq-find (lambda (l) (equal (alist-get 't l) "session-close"))
+                                 lines)))
+            (should close)
+            (should (equal (alist-get 'session close) "b")))
+          (should (equal agent-shell-bridge-app--handles '("a")))
+          (should (null (alist-get "b" agent-shell-bridge-app--titles nil nil #'equal)))
+          ;; last-handle fell back to a surviving session, not the closed one.
+          (should (equal agent-shell-bridge-app--last-handle "a"))
+          ;; closing an unknown handle is a no-op (no extra line).
+          (let ((n (length lines)))
+            (agent-shell-bridge-app--close-session "zzz")
+            (asb-app-test--drain 0.1)
+            (should (= (length lines) n))))
+      (ignore-errors (delete-process server))
+      (agent-shell-bridge-app--disconnect)
+      (ignore-errors (delete-file sock)))))
+
+(ert-deftest asb-app-ensure-proc-spawns-daemon-on-connect-failure ()
+  "A failed connect spawns the daemon: setsid sh -c 'exec <bin> run ...'."
+  (let* ((agent-shell-bridge-app-socket
+          (make-temp-name (expand-file-name "asb-nodaemon-" temporary-file-directory)))
+         (agent-shell-bridge-app-binary "/opt/asb/asb-sidecar")
+         (agent-shell-bridge-app--proc nil)
+         (agent-shell-bridge-app--spawn-cooldown nil)
+         (captured nil))
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args) (setq captured (plist-get args :command)) 'fake)))
+      ;; No server is listening on the socket, so connect fails and we spawn.
+      (should (null (agent-shell-bridge-app--ensure-proc)))
+      (should (equal (nth 0 captured) "setsid"))
+      (should (equal (nth 1 captured) "sh"))
+      (should (equal (nth 2 captured) "-c"))
+      (should (string-match-p "exec /opt/asb/asb-sidecar run" (nth 3 captured)))
+      ;; Cooldown now set: a second failed connect does NOT re-spawn.
+      (setq captured nil)
+      (should (null (agent-shell-bridge-app--ensure-proc)))
+      (should (null captured)))))
+
 (provide 'agent-shell-bridge-app-test)
 ;;; agent-shell-bridge-app-test.el ends here

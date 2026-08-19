@@ -36,6 +36,16 @@
   :type 'file
   :group 'agent-shell-bridge)
 
+(defcustom agent-shell-bridge-app-binary
+  (or (executable-find "asb-sidecar") "asb-sidecar")
+  "The `asb-sidecar' binary Emacs spawns on demand.
+Emacs owns the daemon's lifecycle: the first agent-shell session lazily
+spawns it (detached, so it outlives this Emacs); it is shared across every
+Emacs on the machine (flock-elected) and self-exits once the last live
+agent-shell buffer anywhere closes."
+  :type 'string
+  :group 'agent-shell-bridge)
+
 (defvar agent-shell-bridge-app--proc nil
   "The live network process to the sidecar, or nil.")
 (defvar agent-shell-bridge-app--rx ""
@@ -71,6 +81,10 @@ before any queued `msg' is delivered.")
   "Non-nil once the current connection has been (re-)announced.")
 (defvar agent-shell-bridge-app--retry-timer nil
   "Pending reconnect/flush timer, or nil.")
+(defvar agent-shell-bridge-app--spawn-cooldown nil
+  "Non-nil for a short window after we spawn the daemon, so a burst of failed
+connects doesn't launch a storm (redundant spawns are harmless -- they lose
+the flock election and exit 0 -- but pointless).")
 
 ;;;; Encoding: structured message -> payload alist
 
@@ -228,8 +242,40 @@ before any queued `msg' is delivered.")
              agent-shell-bridge-app--control-cb)
           (error (agent-shell-bridge--log "app: bad inbound line %S: %S" line err)))))))
 
+(defun agent-shell-bridge-app--state-dir ()
+  "Where the daemon keeps its shared state (matches its own `state_dir')."
+  (let ((xdg (getenv "XDG_STATE_HOME")))
+    (if xdg (expand-file-name "asb" xdg)
+      (expand-file-name "~/.local/state/asb"))))
+
+(defun agent-shell-bridge-app--ensure-daemon ()
+  "Spawn the shared `asb-sidecar' daemon, detached, unless just tried.
+Emacs owns the daemon's lifecycle, spawning it lazily when the first
+session needs it.  Detached via `setsid' so it outlives this Emacs; a
+duplicate spawn is safe (it loses the flock election and exits 0).  The
+cooldown only avoids a pointless launch storm while the winner binds."
+  (unless agent-shell-bridge-app--spawn-cooldown
+    (setq agent-shell-bridge-app--spawn-cooldown
+          (run-with-timer 5 nil (lambda ()
+                                  (setq agent-shell-bridge-app--spawn-cooldown nil))))
+    (condition-case err
+        (let* ((log (expand-file-name "daemon.log" (agent-shell-bridge-app--state-dir)))
+               (cmd (format "exec %s run </dev/null >>%s 2>&1"
+                            (shell-quote-argument agent-shell-bridge-app-binary)
+                            (shell-quote-argument log)))
+               (proc (make-process
+                      :name "asb-sidecar-spawn" :noquery t
+                      :connection-type 'pipe :buffer nil
+                      :command (list "setsid" "sh" "-c" cmd))))
+          (set-process-query-on-exit-flag proc nil)
+          (agent-shell-bridge--log "app: spawned daemon (%s)"
+                                   agent-shell-bridge-app-binary))
+      (error (agent-shell-bridge--log "app: daemon spawn failed: %S" err)))))
+
 (defun agent-shell-bridge-app--ensure-proc ()
-  "Return a live process to the sidecar, connecting if needed, or nil."
+  "Return a live process to the sidecar, connecting if needed, or nil.
+On a failed connect, lazily spawn the daemon; the outbox retry timer then
+reconnects once it binds the socket."
   (unless (and agent-shell-bridge-app--proc
                (process-live-p agent-shell-bridge-app--proc))
     (setq agent-shell-bridge-app--rx "")
@@ -244,7 +290,9 @@ before any queued `msg' is delivered.")
       (error
        (agent-shell-bridge--log "app: connect failed (%s): %S"
                                 agent-shell-bridge-app-socket err)
-       (setq agent-shell-bridge-app--proc nil))))
+       (setq agent-shell-bridge-app--proc nil)
+       ;; Nothing listening yet -- Emacs owns the lifecycle, so start it.
+       (agent-shell-bridge-app--ensure-daemon))))
   agent-shell-bridge-app--proc)
 
 (defun agent-shell-bridge-app--title-for (handle)
@@ -382,6 +430,21 @@ the next connection."
    (list (cons 't "status") (cons 'session (or handle agent-shell-bridge-app--last-handle))
          (cons 'state (if running "running" "idle")))))
 
+(defun agent-shell-bridge-app--close-session (handle)
+  "Close just HANDLE: its agent-shell buffer was killed.
+Sends one `session-close' so the daemon's live-session ref-count falls;
+when the last such buffer anywhere closes, the daemon self-exits.  Leaves
+the connection up for the other sessions."
+  (when (member handle agent-shell-bridge-app--handles)
+    (agent-shell-bridge-app--send-emacs-in
+     (list (cons 't "session-close") (cons 'session handle)))
+    (setq agent-shell-bridge-app--handles
+          (delete handle agent-shell-bridge-app--handles))
+    (setf (alist-get handle agent-shell-bridge-app--titles nil t #'equal) nil)
+    (when (equal agent-shell-bridge-app--last-handle handle)
+      (setq agent-shell-bridge-app--last-handle
+            (car agent-shell-bridge-app--handles)))))
+
 (defun agent-shell-bridge-app--stop ()
   (dolist (h agent-shell-bridge-app--handles)
     (agent-shell-bridge-app--send-emacs-in
@@ -403,6 +466,7 @@ the next connection."
    :edit (lambda (&rest _) nil)
    :delete (lambda (&rest _) nil)
    :set-status #'agent-shell-bridge-app--set-status
+   :close-session #'agent-shell-bridge-app--close-session
    :on-inbound (lambda (cb) (setq agent-shell-bridge-app--inbound-cb cb))
    :on-control (lambda (cb) (setq agent-shell-bridge-app--control-cb cb))
    :stop #'agent-shell-bridge-app--stop))

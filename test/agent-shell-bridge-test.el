@@ -336,5 +336,35 @@
      (should (eq (plist-get control :action) 'approve))
      (should (equal (plist-get control :target) "t1")))))
 
+(ert-deftest asb-teardown-session-closes-just-this-buffer ()
+  "Killing one bridged buffer calls the provider's `close-session' for its
+handle and unregisters it, without touching other sessions."
+  (let* ((closed nil)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'stub
+                    :start-session (lambda (&rest _) "h1")
+                    :send (lambda (&rest _) "1")
+                    :edit (lambda (&rest _) nil)
+                    :delete (lambda (&rest _) nil)
+                    :on-inbound (lambda (_) nil)
+                    :on-control (lambda (_) nil)
+                    :close-session (lambda (h) (push h closed))
+                    :stop (lambda () nil))))
+    (agent-shell-bridge-register-provider provider)
+    (agent-shell-bridge-set-provider 'stub)
+    (clrhash agent-shell-bridge--session->buffer)
+    (puthash "h1" (current-buffer) agent-shell-bridge--session->buffer)
+    (puthash "h2" 'other agent-shell-bridge--session->buffer)
+    (setq-local agent-shell-bridge--session-handle "h1")
+    (setq-local agent-shell-bridge--session-started t)
+    (agent-shell-bridge--teardown-session)
+    (should (equal closed '("h1")))
+    (should (null (gethash "h1" agent-shell-bridge--session->buffer)))
+    (should (eq (gethash "h2" agent-shell-bridge--session->buffer) 'other))
+    (should (null agent-shell-bridge--session-handle))
+    ;; Idempotent: a second teardown (no handle) closes nothing more.
+    (agent-shell-bridge--teardown-session)
+    (should (equal closed '("h1")))))
+
 (provide 'agent-shell-bridge-test)
 ;;; agent-shell-bridge-test.el ends here

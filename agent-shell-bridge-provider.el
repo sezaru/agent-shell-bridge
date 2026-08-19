@@ -42,6 +42,10 @@
   on-control
   ;; (session-handle running) -> nil : reflect turn running/idle (optional)
   set-status
+  ;; (session-handle) -> nil : one buffer/session closed, drop just it so the
+  ;; daemon's live-session ref-count falls (optional; distinct from `stop',
+  ;; which tears the whole provider down)
+  close-session
   ;; () -> nil
   stop)
 
