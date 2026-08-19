@@ -46,6 +46,11 @@
   ;; daemon's live-session ref-count falls (optional; distinct from `stop',
   ;; which tears the whole provider down)
   close-session
+  ;; (session-handle) -> `granted' | `denied' | `unavailable' : synchronously
+  ;; reserve a session before agent-shell opens it on resume, so the same
+  ;; session cannot be resumed twice concurrently (optional; `unavailable' when
+  ;; no daemon answers, so the caller fails open)
+  claim-session
   ;; () -> nil
   stop)
 

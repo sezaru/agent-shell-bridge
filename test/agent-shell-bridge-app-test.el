@@ -306,5 +306,46 @@
       (should (null (agent-shell-bridge-app--ensure-proc)))
       (should (null captured)))))
 
+(ert-deftest asb-app-claim-session-granted-then-denied ()
+  "A synchronous claim returns `granted'/`denied' from the daemon's reply."
+  (let* ((sock (make-temp-name
+                (expand-file-name "asb-claim-" temporary-file-directory)))
+         (agent-shell-bridge-app-socket sock)
+         (agent-shell-bridge-app--proc nil)
+         (agent-shell-bridge-app--rx "")
+         (agent-shell-bridge-app--claim-cid 0)
+         (agent-shell-bridge-app--claim-results nil)
+         (agent-shell-bridge-app-claim-timeout 1.0)
+         (grant t) (server nil))
+    (setq server
+          (make-network-process
+           :name "asb-claim-stub" :server t :family 'local :service sock
+           :filter (lambda (proc chunk)
+                     (dolist (l (split-string chunk "\n" t))
+                       (let ((cid (alist-get 'cid (json-read-from-string l))))
+                         (process-send-string
+                          proc (format "{\"t\":\"claim-result\",\"cid\":%d,\"granted\":%s}\n"
+                                       cid (if grant "true" "false"))))))))
+    (unwind-protect
+        (progn
+          (should (eq (agent-shell-bridge-app--claim-session "h") 'granted))
+          (setq grant nil)
+          (should (eq (agent-shell-bridge-app--claim-session "h") 'denied)))
+      (ignore-errors (delete-process server))
+      (agent-shell-bridge-app--disconnect)
+      (ignore-errors (delete-file sock)))))
+
+(ert-deftest asb-app-claim-session-unavailable-without-daemon ()
+  "No daemon answering -> `unavailable', so the caller fails open (never hangs)."
+  (let* ((agent-shell-bridge-app-socket
+          (make-temp-name (expand-file-name "asb-noclaim-" temporary-file-directory)))
+         (agent-shell-bridge-app--proc nil)
+         (agent-shell-bridge-app--rx "")
+         ;; Suppress the lazy daemon spawn so the test has no side effects.
+         (agent-shell-bridge-app--spawn-cooldown t)
+         (agent-shell-bridge-app--claim-cid 0)
+         (agent-shell-bridge-app-claim-timeout 0.3))
+    (should (eq (agent-shell-bridge-app--claim-session "h") 'unavailable))))
+
 (provide 'agent-shell-bridge-app-test)
 ;;; agent-shell-bridge-app-test.el ends here

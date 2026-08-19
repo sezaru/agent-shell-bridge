@@ -85,6 +85,16 @@ before any queued `msg' is delivered.")
   "Non-nil for a short window after we spawn the daemon, so a burst of failed
 connects doesn't launch a storm (redundant spawns are harmless -- they lose
 the flock election and exit 0 -- but pointless).")
+(defvar agent-shell-bridge-app--claim-cid 0
+  "Correlation counter for synchronous `session-claim' round-trips.")
+(defvar agent-shell-bridge-app--claim-results nil
+  "Alist of claim CID -> granted-boolean, filled by inbound `claim-result'.")
+
+(defcustom agent-shell-bridge-app-claim-timeout 2.0
+  "Seconds to wait for the daemon's resume `claim-result' before failing open.
+A resume gate must not hang Emacs, so a silent daemon lets the resume proceed."
+  :type 'number
+  :group 'agent-shell-bridge)
 
 ;;;; Encoding: structured message -> payload alist
 
@@ -193,6 +203,9 @@ the flock election and exit 0 -- but pointless).")
     (pcase (alist-get 't obj)
       ("ack"
        (agent-shell-bridge-app--ack (alist-get 'cid obj)))
+      ("claim-result"
+       (push (cons (alist-get 'cid obj) (eq (alist-get 'granted obj) t))
+             agent-shell-bridge-app--claim-results))
       ("inject"
        (when inbound
          (funcall inbound (list :text (alist-get 'text obj) :session session))))
@@ -430,6 +443,33 @@ the next connection."
    (list (cons 't "status") (cons 'session (or handle agent-shell-bridge-app--last-handle))
          (cons 'state (if running "running" "idle")))))
 
+(defun agent-shell-bridge-app--claim-session (handle)
+  "Synchronously reserve HANDLE against the daemon before a resume opens it.
+Returns `granted', `denied', or `unavailable'.  Blocks up to
+`agent-shell-bridge-app-claim-timeout'; a missing/silent daemon yields
+`unavailable' so the caller fails open (never wedges a resume)."
+  (let ((proc (agent-shell-bridge-app--ensure-proc)))
+    (if (not proc)
+        'unavailable
+      (let ((cid (cl-incf agent-shell-bridge-app--claim-cid)))
+        (if (not (ignore-errors
+                   (process-send-string
+                    proc (agent-shell-bridge-app--line
+                          (list (cons 't "session-claim")
+                                (cons 'session handle) (cons 'cid cid))))
+                   t))
+            'unavailable
+          (let ((deadline (+ (float-time) agent-shell-bridge-app-claim-timeout))
+                (result 'pending))
+            (while (and (eq result 'pending) (< (float-time) deadline))
+              (accept-process-output proc 0.05)
+              (let ((cell (assq cid agent-shell-bridge-app--claim-results)))
+                (when cell
+                  (setq result (if (cdr cell) 'granted 'denied)
+                        agent-shell-bridge-app--claim-results
+                        (assq-delete-all cid agent-shell-bridge-app--claim-results)))))
+            (if (eq result 'pending) 'unavailable result)))))))
+
 (defun agent-shell-bridge-app--close-session (handle)
   "Close just HANDLE: its agent-shell buffer was killed.
 Sends one `session-close' so the daemon's live-session ref-count falls;
@@ -467,6 +507,7 @@ the connection up for the other sessions."
    :delete (lambda (&rest _) nil)
    :set-status #'agent-shell-bridge-app--set-status
    :close-session #'agent-shell-bridge-app--close-session
+   :claim-session #'agent-shell-bridge-app--claim-session
    :on-inbound (lambda (cb) (setq agent-shell-bridge-app--inbound-cb cb))
    :on-control (lambda (cb) (setq agent-shell-bridge-app--control-cb cb))
    :stop #'agent-shell-bridge-app--stop))

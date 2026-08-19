@@ -35,7 +35,8 @@
 (defconst asb-contract-advised-functions
   '(agent-shell--on-notification            ; mirror session updates
     agent-shell--on-request                 ; mirror permission requests
-    agent-shell--send-command)              ; title session + mirror prompt
+    agent-shell--send-command               ; title session + mirror prompt
+    agent-shell--start)                     ; resume funnel: gate concurrent resume
   "agent-shell internals the bridge advises :around.
 A rename/removal here silently stops all mirroring.")
 
@@ -79,7 +80,21 @@ member check would fail -- catching the break the direct-call unit tests miss."
   (should (advice-member-p #'agent-shell-bridge--on-request
                            'agent-shell--on-request))
   (should (advice-member-p #'agent-shell-bridge--on-send-command
-                           'agent-shell--send-command)))
+                           'agent-shell--send-command))
+  (should (advice-member-p #'agent-shell-bridge--on-agent-shell-start
+                           'agent-shell--start)))
+
+(ert-deftest asb-contract/agent-shell--start-takes-session-id ()
+  "The resume gate reads `:session-id' from `agent-shell--start'.  Compiled
+cl-defuns hide their &key args behind &rest, so assert the keyword appears in
+whatever arglist form is exposed (uncompiled) -- and always that it is callable."
+  (should (fboundp 'agent-shell--start))
+  (let ((arglist (ignore-errors (help-function-arglist 'agent-shell--start t))))
+    ;; When the real arglist is visible (source form), it must offer session-id;
+    ;; when hidden (&rest rest on a compiled cl-defun) we can't assert here -- L2
+    ;; drives a real resume to prove the convention behaviorally.
+    (when (and arglist (not (memq '&rest arglist)))
+      (should (memq 'session-id arglist)))))
 
 (provide 'agent-shell-bridge-contract-test)
 ;;; agent-shell-bridge-contract-test.el ends here

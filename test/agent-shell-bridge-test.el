@@ -366,5 +366,52 @@ handle and unregisters it, without touching other sessions."
     (agent-shell-bridge--teardown-session)
     (should (equal closed '("h1")))))
 
+(ert-deftest asb-agent-shell-start-advice-gates-resume ()
+  "The `agent-shell--start' advice blocks a denied resume before it opens, and
+lets everything else through: granted resume, no-session-id, un-mirrored id."
+  (let* ((claimed nil)
+         (verdict 'granted)
+         (provider (agent-shell-bridge-provider-create
+                    :name 'stub
+                    :start-session (lambda (&rest _) "h")
+                    :send (lambda (&rest _) "1")
+                    :edit (lambda (&rest _) nil)
+                    :delete (lambda (&rest _) nil)
+                    :on-inbound (lambda (_) nil)
+                    :on-control (lambda (_) nil)
+                    :claim-session (lambda (h) (push h claimed) verdict)
+                    :stop (lambda () nil)))
+         (agent-shell-bridge-session-file
+          (make-temp-file "asb-links" nil ".eld"))
+         (called nil)
+         (orig (lambda (&rest _) (setq called t) 'started)))
+    (unwind-protect
+        (progn
+          (agent-shell-bridge-register-provider provider)
+          (agent-shell-bridge-set-provider 'stub)
+          (agent-shell-bridge--save-handle "sid" "h-sid")
+          ;; granted: claim runs, original proceeds.
+          (should (eq (agent-shell-bridge--on-agent-shell-start orig :session-id "sid")
+                      'started))
+          (should called)
+          (should (equal claimed '("h-sid")))
+          ;; denied: user-error before the buffer opens; original NOT called.
+          (setq verdict 'denied called nil claimed nil)
+          (should-error (agent-shell-bridge--on-agent-shell-start orig :session-id "sid")
+                        :type 'user-error)
+          (should-not called)
+          (should (equal claimed '("h-sid")))
+          ;; fresh start (no session-id): no claim, proceeds.
+          (setq verdict 'denied called nil claimed nil)
+          (agent-shell-bridge--on-agent-shell-start orig :config 'x)
+          (should called)
+          (should (null claimed))
+          ;; resume of a session we never mirrored (no saved handle): no claim.
+          (setq called nil claimed nil)
+          (agent-shell-bridge--on-agent-shell-start orig :session-id "unknown")
+          (should called)
+          (should (null claimed)))
+      (ignore-errors (delete-file agent-shell-bridge-session-file)))))
+
 (provide 'agent-shell-bridge-test)
 ;;; agent-shell-bridge-test.el ends here

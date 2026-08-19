@@ -766,6 +766,24 @@ ORIG-FN and ARGS are the advised call."
                   agent-shell-bridge--pending-permissions))))))
   (apply orig-fn args))
 
+(defun agent-shell-bridge--on-agent-shell-start (orig-fn &rest args)
+  "Around-advice for `agent-shell--start' -- the funnel every resume path hits.
+On a resume (`:session-id' present) whose session we already mirror, ask the
+provider to synchronously reserve it; a `denied' means it is open in another
+buffer/instance, so `user-error' out BEFORE the buffer opens.  Fresh starts
+\(no session-id), un-mirrored sessions, and providers without a claim slot all
+fall through untouched, as does an `unavailable' daemon (fail open)."
+  (let ((session-id (plist-get args :session-id)))
+    (when session-id
+      (let* ((provider (ignore-errors (agent-shell-bridge-active-provider)))
+             (claim (and provider (agent-shell-bridge-provider-claim-session provider)))
+             (handle (and claim (agent-shell-bridge--load-handle session-id))))
+        (when (and claim handle
+                   (eq (funcall claim handle) 'denied))
+          (user-error
+           "asb: session already open in another buffer or Emacs instance")))))
+  (apply orig-fn args))
+
 ;;;; Minor mode
 
 (defvar agent-shell-bridge--advice-installed nil)
@@ -779,6 +797,9 @@ ORIG-FN and ARGS are the advised call."
                 #'agent-shell-bridge--on-request)
     (advice-add 'agent-shell--send-command :around
                 #'agent-shell-bridge--on-send-command)
+    (when (fboundp 'agent-shell--start)
+      (advice-add 'agent-shell--start :around
+                  #'agent-shell-bridge--on-agent-shell-start))
     (setq agent-shell-bridge--advice-installed t)))
 
 (defvar-local agent-shell-bridge--turn-subscription nil
