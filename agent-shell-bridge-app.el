@@ -47,6 +47,30 @@
   "Known session handles, for `session-close' on stop.")
 (defvar agent-shell-bridge-app--last-handle nil
   "Most recent session handle, used when a message omits `:session'.")
+(defvar agent-shell-bridge-app--outbox nil
+  "FIFO queue of pending messages awaiting *acknowledgement* (oldest first).
+Each entry is a cons (CID . OBJ). The sidecar link is treated as unreliable:
+a message is held here until the sidecar acks its CID (durably applied), not
+merely until it is written to the socket -- so a daemon that dies mid-write
+loses nothing, the un-acked entry is replayed on reconnect.")
+(defvar agent-shell-bridge-app--epoch
+  (format "%d-%d" (emacs-pid) (random (expt 2 31)))
+  "Process-unique token qualifying our monotonic CIDs. A fresh Emacs gets a
+fresh epoch, so the sidecar's per-epoch high-water never wrongly skips our
+restarted-from-1 CIDs.")
+(defvar agent-shell-bridge-app--cid 0
+  "Monotonic client-id counter within this epoch.")
+(defvar agent-shell-bridge-app--inflight nil
+  "CIDs already written on the *current* connection (so a live pump does not
+resend them). Cleared on every fresh connection, forcing a full replay.")
+(defvar agent-shell-bridge-app--titles nil
+  "Alist of session handle -> title, replayed as `session-open' on reconnect
+so a restarted daemon (which forgot its in-memory registry) re-learns them
+before any queued `msg' is delivered.")
+(defvar agent-shell-bridge-app--was-live nil
+  "Non-nil once the current connection has been (re-)announced.")
+(defvar agent-shell-bridge-app--retry-timer nil
+  "Pending reconnect/flush timer, or nil.")
 
 ;;;; Encoding: structured message -> payload alist
 
@@ -153,6 +177,8 @@
   "Dispatch a decoded `EmacsOut' OBJ to INBOUND/CONTROL callbacks."
   (let ((session (alist-get 'session obj)))
     (pcase (alist-get 't obj)
+      ("ack"
+       (agent-shell-bridge-app--ack (alist-get 'cid obj)))
       ("inject"
        (when inbound
          (funcall inbound (list :text (alist-get 'text obj) :session session))))
@@ -181,7 +207,12 @@
   (when (or (not agent-shell-bridge-app--proc)
             (not (process-live-p agent-shell-bridge-app--proc)))
     (setq agent-shell-bridge-app--proc nil
-          agent-shell-bridge-app--rx "")))
+          agent-shell-bridge-app--rx ""
+          agent-shell-bridge-app--was-live nil)
+    ;; The socket dropped -- keep retrying while anything is queued so the
+    ;; backlog flushes the instant the daemon (or network) returns.
+    (when agent-shell-bridge-app--outbox
+      (agent-shell-bridge-app--schedule-retry))))
 
 (defun agent-shell-bridge-app--filter (_proc chunk)
   (setq agent-shell-bridge-app--rx (concat agent-shell-bridge-app--rx chunk))
@@ -216,18 +247,103 @@
        (setq agent-shell-bridge-app--proc nil))))
   agent-shell-bridge-app--proc)
 
+(defun agent-shell-bridge-app--title-for (handle)
+  "Best-known title for HANDLE: the cached title, else the owning buffer's."
+  (or (alist-get handle agent-shell-bridge-app--titles nil nil #'equal)
+      (let ((buf (and (boundp 'agent-shell-bridge--session->buffer)
+                      (gethash handle agent-shell-bridge--session->buffer))))
+        (and (buffer-live-p buf)
+             (buffer-local-value 'agent-shell-bridge--session-title buf)))
+      "session"))
+
+(defun agent-shell-bridge-app--reannounce ()
+  "Re-send `session-open' for every known session on a fresh connection.
+Iterates the live handle set (not just the title cache) so a session
+opened before this connection is still re-registered -- otherwise a
+restarted daemon rejects its queued `msg's as unknown."
+  (dolist (handle agent-shell-bridge-app--handles)
+    (ignore-errors
+      (process-send-string
+       agent-shell-bridge-app--proc
+       (agent-shell-bridge-app--line
+        (list (cons 't "session-open")
+              (cons 'session handle)
+              (cons 'title (agent-shell-bridge-app--title-for handle))))))))
+
+(defun agent-shell-bridge-app--schedule-retry ()
+  "Ensure a pending timer will retry delivery of the outbox."
+  (unless agent-shell-bridge-app--retry-timer
+    (setq agent-shell-bridge-app--retry-timer
+          (run-with-timer 1 nil #'agent-shell-bridge-app--retry-tick))))
+
+(defun agent-shell-bridge-app--retry-tick ()
+  (setq agent-shell-bridge-app--retry-timer nil)
+  (when agent-shell-bridge-app--outbox
+    (agent-shell-bridge-app--pump)))
+
+(defun agent-shell-bridge-app--ack (cid)
+  "Drop the acked CID from the outbox -- the sidecar has durably applied it."
+  (when (integerp cid)
+    (setq agent-shell-bridge-app--outbox
+          (assq-delete-all cid agent-shell-bridge-app--outbox)
+          agent-shell-bridge-app--inflight
+          (delq cid agent-shell-bridge-app--inflight))
+    ;; No timer needed once everything is acknowledged.
+    (when (and (null agent-shell-bridge-app--outbox)
+               agent-shell-bridge-app--retry-timer)
+      (cancel-timer agent-shell-bridge-app--retry-timer)
+      (setq agent-shell-bridge-app--retry-timer nil))))
+
+(defun agent-shell-bridge-app--pump ()
+  "Ensure a connection and write every un-acked outbox entry; retry until acked.
+Entries are held until the sidecar acks their CID, not merely until written,
+so a daemon dying mid-write loses nothing -- the un-acked entry is resent on
+the next connection."
+  (let ((proc (agent-shell-bridge-app--ensure-proc)))
+    (if (not proc)
+        (agent-shell-bridge-app--schedule-retry)
+      ;; A fresh (re)connection: the daemon may have restarted and forgotten
+      ;; its session registry, so re-announce every session before replaying
+      ;; queued `msg's (which it would otherwise reject as unknown). Clearing
+      ;; in-flight forces a full replay of everything not yet acked.
+      (unless agent-shell-bridge-app--was-live
+        (setq agent-shell-bridge-app--was-live t
+              agent-shell-bridge-app--inflight nil)
+        (agent-shell-bridge-app--reannounce))
+      (let ((ok t))
+        (dolist (entry agent-shell-bridge-app--outbox)
+          (let ((cid (car entry)) (obj (cdr entry)))
+            (when (and ok (not (memq cid agent-shell-bridge-app--inflight)))
+              (condition-case err
+                  (progn
+                    (process-send-string
+                     proc (agent-shell-bridge-app--line
+                           (append obj
+                                   (list (cons 'cid cid)
+                                         (cons 'epoch agent-shell-bridge-app--epoch)))))
+                    (push cid agent-shell-bridge-app--inflight))
+                (error
+                 (agent-shell-bridge--log "app: send failed, will retry: %S" err)
+                 (setq ok nil agent-shell-bridge-app--was-live nil)
+                 (agent-shell-bridge-app--schedule-retry)))))))
+      ;; Keep a heartbeat while anything is still awaiting an ack.
+      (when agent-shell-bridge-app--outbox
+        (agent-shell-bridge-app--schedule-retry)))))
+
 (defun agent-shell-bridge-app--send-emacs-in (obj)
-  "Send OBJ (an `EmacsIn' alist) as one ndjson line; nil on failure."
-  (when-let* ((proc (agent-shell-bridge-app--ensure-proc)))
-    (condition-case err
-        (progn (process-send-string proc (agent-shell-bridge-app--line obj)) t)
-      (error (agent-shell-bridge--log "app: send failed: %S" err) nil))))
+  "Queue OBJ (an `EmacsIn' alist) for reliable, ack-gated, in-order delivery."
+  (let ((cid (cl-incf agent-shell-bridge-app--cid)))
+    (setq agent-shell-bridge-app--outbox
+          (nconc agent-shell-bridge-app--outbox (list (cons cid obj)))))
+  (agent-shell-bridge-app--pump)
+  t)
 
 (defun agent-shell-bridge-app--disconnect ()
   (when agent-shell-bridge-app--proc
     (ignore-errors (delete-process agent-shell-bridge-app--proc)))
   (setq agent-shell-bridge-app--proc nil
-        agent-shell-bridge-app--rx ""))
+        agent-shell-bridge-app--rx ""
+        agent-shell-bridge-app--was-live nil))
 
 ;;;; Provider slots
 
@@ -238,10 +354,12 @@
                             (cl-incf agent-shell-bridge-app--counter)))))
     (setq agent-shell-bridge-app--last-handle handle)
     (cl-pushnew handle agent-shell-bridge-app--handles :test #'equal)
-    (agent-shell-bridge-app--send-emacs-in
-     (list (cons 't "session-open")
-           (cons 'session handle)
-           (cons 'title (or (plist-get meta :title) (plist-get meta :name) "session"))))
+    (let ((title (or (plist-get meta :title) (plist-get meta :name) "session")))
+      (setf (alist-get handle agent-shell-bridge-app--titles nil nil #'equal) title)
+      (agent-shell-bridge-app--send-emacs-in
+       (list (cons 't "session-open")
+             (cons 'session handle)
+             (cons 'title title))))
     handle))
 
 (defun agent-shell-bridge-app--send (message)
@@ -268,7 +386,11 @@
   (dolist (h agent-shell-bridge-app--handles)
     (agent-shell-bridge-app--send-emacs-in
      (list (cons 't "session-close") (cons 'session h))))
-  (setq agent-shell-bridge-app--handles nil)
+  (setq agent-shell-bridge-app--handles nil
+        agent-shell-bridge-app--titles nil)
+  (when agent-shell-bridge-app--retry-timer
+    (cancel-timer agent-shell-bridge-app--retry-timer)
+    (setq agent-shell-bridge-app--retry-timer nil))
   (agent-shell-bridge-app--disconnect))
 
 (defun agent-shell-bridge-app-provider ()

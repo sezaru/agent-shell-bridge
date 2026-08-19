@@ -155,6 +155,8 @@ UPDATE is the value of (params update) in an ACP session notification."
     ("tool_call_update"
      (let* ((id (alist-get 'toolCallId update))
             (status (alist-get 'status update))
+            (raw (alist-get 'rawInput update))
+            (command (alist-get 'command raw))
             (output (agent-shell-bridge--tool-output update)))
        (agent-shell-bridge-make-message
         :id id :role 'tool
@@ -164,8 +166,15 @@ UPDATE is the value of (params update) in an ACP session notification."
                   (_ 'streaming))
         :parts (list (agent-shell-bridge-make-part
                       :kind 'tool-call
-                      :content (or output "")
-                      :meta (list :tool-call-id id :status status))))))
+                      ;; The executed command only lands on the first update's
+                      ;; rawInput -- the initial tool_call has none. Surface it
+                      ;; as the tool line ("$ cmd"); the completed update carries
+                      ;; the real output.
+                      :content (cond (command (concat "$ " command))
+                                     (output output)
+                                     (t ""))
+                      :meta (list :tool-call-id id :status status
+                                  :command command))))))
     (_ nil)))
 
 (defun agent-shell-bridge--normalize-permission (request)
