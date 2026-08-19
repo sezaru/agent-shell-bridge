@@ -315,10 +315,16 @@ cooldown only avoids a pointless launch storm while the winner binds."
           (run-with-timer 5 nil (lambda ()
                                   (setq agent-shell-bridge-app--spawn-cooldown nil))))
     (condition-case err
-        (let* ((log (expand-file-name "daemon.log" (agent-shell-bridge-app--state-dir)))
+        (let* ((state (agent-shell-bridge-app--state-dir))
+               (log (expand-file-name "daemon.log" state))
                (cmd (format "exec %s run </dev/null >>%s 2>&1"
                             (shell-quote-argument agent-shell-bridge-app-binary)
                             (shell-quote-argument log)))
+               ;; The shell opens `daemon.log' (>>) before exec; without this dir
+               ;; the redirect fails and the daemon never starts (it can't create
+               ;; its own state dir -- the binary never runs). Bites the first
+               ;; spawn on a machine with no state dir yet. Must precede the spawn.
+               (_ (make-directory state t))
                (proc (make-process
                       :name "asb-sidecar-spawn" :noquery t
                       :connection-type 'pipe :buffer nil
