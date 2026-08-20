@@ -142,6 +142,23 @@
      #'ignore (lambda (ev) (setq got ev)))
     (should (eq (plist-get got :action) 'interrupt))))
 
+(ert-deftest asb-app-inbound-new-session ()
+  (let (got)
+    (agent-shell-bridge-app--handle
+     '((t . "new-session") (prompt . "fix the auth test") (cwd . "/home/me/p"))
+     #'ignore #'ignore (lambda (ev) (setq got ev)))
+    (should (eq (plist-get got :action) 'new))
+    (should (equal (plist-get got :prompt) "fix the auth test"))
+    (should (equal (plist-get got :cwd) "/home/me/p"))))
+
+(ert-deftest asb-app-inbound-resume-session ()
+  (let (got)
+    (agent-shell-bridge-app--handle
+     '((t . "resume-session") (session . "sess-123"))
+     #'ignore #'ignore (lambda (ev) (setq got ev)))
+    (should (eq (plist-get got :action) 'resume))
+    (should (equal (plist-get got :session) "sess-123"))))
+
 ;;;; Task 4/5 — socket loopback
 
 (defun asb-app-test--drain (&optional secs)

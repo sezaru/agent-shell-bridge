@@ -40,8 +40,19 @@
   on-inbound
   ;; (callback): callback receives (:action SYM :target ID :session HANDLE)
   on-control
+  ;; (callback): callback receives a remote session-creation request —
+  ;; (:action `new' :prompt STR :cwd STR-or-nil) to start a fresh session, or
+  ;; (:action `resume' :session HANDLE) to reopen a closed one.  Unlike
+  ;; `on-inbound'/`on-control', this fires with no owning buffer, so the core
+  ;; registers it once at startup rather than per session (optional).
+  on-create
   ;; (session-handle running) -> nil : reflect turn running/idle (optional)
   set-status
+  ;; (session-handle config-plist) -> nil : mirror the session's backend knobs
+  ;; (models/modes/thought levels + current, and advertised slash commands) so
+  ;; a remote surface can present them instead of hardcoding (optional). The
+  ;; plist is provider-agnostic; see `agent-shell-bridge--config-plist'.
+  config
   ;; (session-handle) -> nil : one buffer/session closed, drop just it so the
   ;; daemon's live-session ref-count falls (optional; distinct from `stop',
   ;; which tears the whole provider down)

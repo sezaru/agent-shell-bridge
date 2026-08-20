@@ -52,6 +52,10 @@ agent-shell buffer anywhere closes."
   "Partial inbound buffer for line framing.")
 (defvar agent-shell-bridge-app--inbound-cb nil)
 (defvar agent-shell-bridge-app--control-cb nil)
+(defvar agent-shell-bridge-app--create-cb nil
+  "Global handler for remote session-creation (`new-session'/`resume-session').
+Registered once at startup (not per buffer): these arrive with no owning
+session, so the first session can be created from the phone.")
 (defvar agent-shell-bridge-app--counter 0)
 (defvar agent-shell-bridge-app--handles nil
   "Known session handles, for `session-close' on stop.")
@@ -146,6 +150,18 @@ A resume gate must not hang Emacs, so a silent daemon lets the resume proceed."
                        (cons 'text (agent-shell-bridge-message-text message))))
       ('user   (list (cons 'type "user_message")
                      (cons 'text (agent-shell-bridge-message-text message))))
+      ('plan
+       (list (cons 'type "plan")
+             (cons 'entries
+                   (apply #'vector
+                          (mapcar
+                           (lambda (e)
+                             (list (cons 'content (or (map-elt e 'content)
+                                                      (map-elt e 'step) ""))
+                                   ;; ACP already uses pending/in_progress/
+                                   ;; completed, matching our PlanStatus.
+                                   (cons 'status (or (map-elt e 'status) "pending"))))
+                           (append (plist-get meta :entries) nil))))))
       ('tool
        (let ((id (or (plist-get meta :tool-call-id) (plist-get message :id) "")))
          (if (eq status 'pending)
@@ -232,8 +248,8 @@ counter continues, so new phrases append past the high-water."
 
 ;;;; Inbound decode -> callbacks
 
-(defun agent-shell-bridge-app--handle (obj inbound control)
-  "Dispatch a decoded `EmacsOut' OBJ to INBOUND/CONTROL callbacks."
+(defun agent-shell-bridge-app--handle (obj inbound control &optional create)
+  "Dispatch a decoded `EmacsOut' OBJ to INBOUND/CONTROL/CREATE callbacks."
   (let ((session (alist-get 'session obj)))
     (pcase (alist-get 't obj)
       ("ack"
@@ -269,7 +285,15 @@ counter continues, so new phrases append past the high-water."
                                   :session session)))))
       ("interrupt"
        (when control
-         (funcall control (list :action 'interrupt :session session)))))))
+         (funcall control (list :action 'interrupt :session session))))
+      ("new-session"
+       (when create
+         (funcall create (list :action 'new
+                               :prompt (alist-get 'prompt obj)
+                               :cwd (alist-get 'cwd obj)))))
+      ("resume-session"
+       (when create
+         (funcall create (list :action 'resume :session session)))))))
 
 ;;;; Socket lifecycle + framing
 
@@ -295,7 +319,8 @@ counter continues, so new phrases append past the high-water."
             (agent-shell-bridge-app--handle
              (json-read-from-string line)
              agent-shell-bridge-app--inbound-cb
-             agent-shell-bridge-app--control-cb)
+             agent-shell-bridge-app--control-cb
+             agent-shell-bridge-app--create-cb)
           (error (agent-shell-bridge--log "app: bad inbound line %S: %S" line err)))))))
 
 (defun agent-shell-bridge-app--state-dir ()
@@ -508,6 +533,36 @@ provider is the active one."
    (list (cons 't "status") (cons 'session (or handle agent-shell-bridge-app--last-handle))
          (cons 'state (if running "running" "idle")))))
 
+(defun agent-shell-bridge-app--wire-opts (opts)
+  "Encode provider-agnostic config OPTS as a wire vector of {id,name,description}."
+  (apply #'vector
+         (mapcar (lambda (o)
+                   (list (cons 'id (or (plist-get o :id) ""))
+                         (cons 'name (or (plist-get o :name) ""))
+                         (cons 'description (plist-get o :description))))
+                 opts)))
+
+(defun agent-shell-bridge-app--config (handle plist)
+  "Mirror a session's backend knobs/commands PLIST for HANDLE as a `config' line."
+  (agent-shell-bridge-app--send-emacs-in
+   (list
+    (cons 't "config")
+    (cons 'session handle)
+    (cons 'config
+          (list (cons 'models (agent-shell-bridge-app--wire-opts (plist-get plist :models)))
+                (cons 'current_model (plist-get plist :current-model))
+                (cons 'modes (agent-shell-bridge-app--wire-opts (plist-get plist :modes)))
+                (cons 'current_mode (plist-get plist :current-mode))
+                (cons 'thought_levels
+                      (agent-shell-bridge-app--wire-opts (plist-get plist :thought-levels)))
+                (cons 'current_thought (plist-get plist :current-thought))
+                (cons 'commands
+                      (apply #'vector
+                             (mapcar (lambda (c)
+                                       (list (cons 'name (or (plist-get c :name) ""))
+                                             (cons 'description (plist-get c :description))))
+                                     (plist-get plist :commands)))))))))
+
 (defun agent-shell-bridge-app--claim-session (handle)
   "Synchronously reserve HANDLE against the daemon before a resume opens it.
 Returns `granted', `denied', or `unavailable'.  Blocks up to
@@ -575,10 +630,12 @@ the connection up for the other sessions."
    :edit (lambda (&rest _) nil)
    :delete (lambda (&rest _) nil)
    :set-status #'agent-shell-bridge-app--set-status
+   :config #'agent-shell-bridge-app--config
    :close-session #'agent-shell-bridge-app--close-session
    :claim-session #'agent-shell-bridge-app--claim-session
    :on-inbound (lambda (cb) (setq agent-shell-bridge-app--inbound-cb cb))
    :on-control (lambda (cb) (setq agent-shell-bridge-app--control-cb cb))
+   :on-create (lambda (cb) (setq agent-shell-bridge-app--create-cb cb))
    :stop #'agent-shell-bridge-app--stop))
 
 ;;;###autoload
@@ -587,6 +644,11 @@ the connection up for the other sessions."
   (interactive)
   (agent-shell-bridge-register-provider (agent-shell-bridge-app-provider))
   (agent-shell-bridge-set-provider 'app)
+  ;; Wire the global remote-create handler once (session-less, so not per
+  ;; buffer): lets the phone start a new session or reopen a closed one.
+  (when-let* ((p (agent-shell-bridge-active-provider))
+              (on-create (agent-shell-bridge-provider-on-create p)))
+    (funcall on-create #'agent-shell-bridge--handle-create))
   ;; Register a resumed session with the daemon when the core relinks it
   ;; (idempotent: add-hook de-dups on the same symbol).
   (add-hook 'agent-shell-bridge--relink-functions

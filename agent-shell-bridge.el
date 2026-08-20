@@ -175,6 +175,15 @@ UPDATE is the value of (params update) in an ACP session notification."
                                      (t ""))
                       :meta (list :tool-call-id id :status status
                                   :command command))))))
+    ("plan"
+     ;; A standalone plan update: entries carry their own lifecycle status, so
+     ;; the client can render real progress rather than guessing by position.
+     (agent-shell-bridge-make-message
+      :role 'plan :status 'complete
+      :parts (list (agent-shell-bridge-make-part
+                    :kind 'plan
+                    :content ""
+                    :meta (list :entries (alist-get 'entries update))))))
     (_ nil)))
 
 (defun agent-shell-bridge--normalize-permission (request)
@@ -215,6 +224,51 @@ UPDATE is the value of (params update) in an ACP session notification."
     (when fn
       (ignore-errors
         (funcall fn agent-shell-bridge--session-handle running)))))
+
+(declare-function agent-shell--get-available-models "agent-shell-config")
+(declare-function agent-shell--current-model-id "agent-shell-config")
+(declare-function agent-shell--get-available-modes "agent-shell")
+(declare-function agent-shell--current-mode-id "agent-shell-config")
+(declare-function agent-shell--get-available-thought-levels "agent-shell-config")
+(declare-function agent-shell--current-thought-level-id "agent-shell-config")
+
+(defun agent-shell-bridge--config-plist (state)
+  "Provider-agnostic snapshot of STATE's backend knobs and slash commands.
+
+Reads agent-shell's own accessors, so the option ids/names always match
+what the agent would accept back.  Every read is guarded — a shape change
+in agent-shell degrades a field to nil rather than breaking the bridge."
+  (cl-flet ((opts (getter id-fn)
+              (ignore-errors
+                (mapcar (lambda (o)
+                          (list :id (let ((v (funcall id-fn o))) (and v (format "%s" v)))
+                                :name (or (map-elt o :name) (map-elt o 'name) "")
+                                :description (or (map-elt o :description)
+                                                 (map-elt o 'description))))
+                        (funcall getter state)))))
+    (list :models (opts #'agent-shell--get-available-models
+                        (lambda (o) (or (map-elt o :model-id) (map-elt o :id) (map-elt o :value))))
+          :current-model (ignore-errors (agent-shell--current-model-id state))
+          :modes (opts #'agent-shell--get-available-modes
+                       (lambda (o) (or (map-elt o :id) (map-elt o :value))))
+          :current-mode (ignore-errors (agent-shell--current-mode-id state))
+          :thought-levels (opts #'agent-shell--get-available-thought-levels
+                                (lambda (o) (or (map-elt o :value) (map-elt o :id))))
+          :current-thought (ignore-errors (agent-shell--current-thought-level-id state))
+          :commands (ignore-errors
+                      (mapcar (lambda (c)
+                                (list :name (concat "/" (format "%s" (map-elt c 'name)))
+                                      :description (map-elt c 'description)))
+                              (map-elt state :available-commands))))))
+
+(defun agent-shell-bridge--emit-config ()
+  "Send the current session's config snapshot to the active provider, if any."
+  (let* ((provider (agent-shell-bridge-active-provider))
+         (fn (and provider (agent-shell-bridge-provider-config provider))))
+    (when (and fn (fboundp 'agent-shell--state))
+      (ignore-errors
+        (funcall fn agent-shell-bridge--session-handle
+                 (agent-shell-bridge--config-plist (agent-shell--state)))))))
 
 (defun agent-shell-bridge--edit (remote-id message)
   "Edit REMOTE-ID to MESSAGE via the active provider."
@@ -364,7 +418,10 @@ new one."
         (agent-shell-bridge--log "ensure-session: registered handle=%S -> %S"
                                  handle (current-buffer))
         (when (and session-id (not existing))
-          (agent-shell-bridge--save-handle session-id handle))))))
+          (agent-shell-bridge--save-handle session-id handle))
+        ;; Remember where this session runs so a phone can reopen it in place.
+        (when session-id
+          (agent-shell-bridge--save-cwd session-id default-directory))))))
 
 (defvar agent-shell-bridge--relink-functions nil
   "Abnormal hook run with the provider HANDLE when a resumed session is
@@ -692,6 +749,118 @@ actions (expand/collapse/full/hide) are provider-side concerns."
              (when (fboundp 'agent-shell-interrupt)
                (ignore-errors (agent-shell-interrupt t))))))))))
 
+;;;; Remote session creation (phone -> new/resumed agent-shell session)
+
+(declare-function agent-shell--new-shell "agent-shell")
+(declare-function agent-shell--start "agent-shell")
+(declare-function agent-shell--auto-preferred-config "agent-shell")
+(declare-function agent-shell--insert-to-shell-buffer "agent-shell")
+
+(defcustom agent-shell-bridge-remote-default-directory "~/"
+  "Working directory for a phone-started session when it names no `cwd'."
+  :type 'directory
+  :group 'agent-shell-bridge)
+
+(defcustom agent-shell-bridge-session-cwd-file
+  (locate-user-emacs-file "agent-shell-bridge-cwds.eld")
+  "File persisting agent-shell session-id -> working directory.
+Lets a phone reopen a closed session in the project it ran in."
+  :type 'file
+  :group 'agent-shell-bridge)
+
+(defun agent-shell-bridge--load-cwds ()
+  (when (file-exists-p agent-shell-bridge-session-cwd-file)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents agent-shell-bridge-session-cwd-file)
+        (read (current-buffer))))))
+
+(defun agent-shell-bridge--load-cwd (session-id)
+  (cdr (assoc session-id (agent-shell-bridge--load-cwds))))
+
+(defun agent-shell-bridge--save-cwd (session-id dir)
+  "Persist SESSION-ID -> DIR so a closed session can be reopened in place."
+  (when (and session-id dir)
+    (let ((links (cons (cons session-id dir)
+                       (assoc-delete-all session-id
+                                         (agent-shell-bridge--load-cwds)))))
+      (ignore-errors
+        (make-directory (file-name-directory agent-shell-bridge-session-cwd-file) t)
+        (with-temp-file agent-shell-bridge-session-cwd-file
+          (prin1 links (current-buffer)))))))
+
+(defun agent-shell-bridge--handle-create (event)
+  "Handle a remote session-creation EVENT from a phone.
+`:action new' starts a fresh session in `:cwd' and submits `:prompt';
+`:action resume' reopens the closed session named by `:session'.  Runs
+off the socket filter (a 0s timer) so buffer/session setup happens on the
+main loop, and never lets an error escape the transport."
+  (run-with-timer
+   0 nil
+   (lambda ()
+     (condition-case err
+         (pcase (plist-get event :action)
+           ('new (agent-shell-bridge--remote-new-session
+                  (plist-get event :prompt) (plist-get event :cwd)))
+           ('resume (agent-shell-bridge--remote-resume-session
+                     (plist-get event :session))))
+       (error (agent-shell-bridge--log "handle-create failed: %S" err))))))
+
+(defun agent-shell-bridge--remote-new-session (prompt cwd)
+  "Start a fresh agent-shell in CWD, enable the bridge, and submit PROMPT.
+The session mirrors back through the normal path (its first user message
+comes from `--on-send-command', so the phone sees the prompt it sent)."
+  (unless (fboundp 'agent-shell--new-shell)
+    (error "agent-shell--new-shell unavailable"))
+  (let* ((dir (expand-file-name
+               (or (and cwd (> (length (string-trim cwd)) 0) cwd)
+                   agent-shell-bridge-remote-default-directory)))
+         (default-directory dir)
+         (buffer (agent-shell--new-shell :location dir :no-display t)))
+    (unless (buffer-live-p buffer)
+      (error "agent-shell--new-shell returned no buffer"))
+    (with-current-buffer buffer
+      (unless (bound-and-true-p agent-shell-bridge-mode)
+        (agent-shell-bridge-mode 1)))
+    (when (and prompt (> (length (string-trim prompt)) 0))
+      (agent-shell-bridge--submit-when-ready buffer prompt))))
+
+(defun agent-shell-bridge--submit-when-ready (buffer text &optional attempts)
+  "Insert TEXT into BUFFER and submit once its ACP session id is ready.
+A freshly-started shell initializes its session asynchronously; submitting
+before the id exists errors, so retry briefly.  Left as a local submit (no
+`--from-remote'), so the prompt mirrors as the session's first user message."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (cond
+       ((map-nested-elt (bound-and-true-p agent-shell--state) '(:session :id))
+        (ignore-errors
+          (agent-shell--insert-to-shell-buffer
+           :shell-buffer buffer :text text :submit t :no-focus t)))
+       ((>= (or attempts 0) 40)
+        (agent-shell-bridge--log "remote new-session: session never became ready"))
+       (t
+        (run-with-timer 0.25 nil #'agent-shell-bridge--submit-when-ready
+                        buffer text (1+ (or attempts 0))))))))
+
+(defun agent-shell-bridge--remote-resume-session (session-id)
+  "Reopen the closed session SESSION-ID in the project it ran in.
+No-op if it is already open in a buffer.  Fresh Emacs machinery (the
+`agent-shell--start' advice + relink) re-links it to its persisted post."
+  (unless (and session-id (fboundp 'agent-shell--start))
+    (error "cannot resume %S" session-id))
+  (if (agent-shell-bridge--buffer-for-session session-id)
+      (agent-shell-bridge--log "resume: %S already open" session-id)
+    (let* ((dir (or (agent-shell-bridge--load-cwd session-id)
+                    agent-shell-bridge-remote-default-directory))
+           (default-directory (expand-file-name dir)))
+      (agent-shell--start
+       :config (agent-shell--auto-preferred-config)
+       :session-strategy 'new
+       :session-id session-id
+       :new-session t
+       :no-focus t))))
+
 ;;;; Capture layer (advice around agent-shell internals)
 
 (defun agent-shell-bridge--on-notification (orig-fn &rest args)
@@ -717,7 +886,14 @@ ORIG-FN and ARGS are the advised call."
                            (agent-shell-bridge--normalize-update update))))
         (when message
           (with-current-buffer buffer
-            (agent-shell-bridge--feed message))))))
+            (agent-shell-bridge--feed message)))
+        ;; Config-bearing updates don't normalize to a message; re-snapshot the
+        ;; knobs/commands so the phone's pickers and autocomplete stay current.
+        (when (member (and update (alist-get 'sessionUpdate update))
+                      '("available_commands_update" "current_mode_update"
+                        "current_model_update" "config_option_update"))
+          (with-current-buffer buffer
+            (agent-shell-bridge--emit-config))))))
   (apply orig-fn args))
 
 (defun agent-shell-bridge--on-send-command (orig-fn &rest args)
@@ -731,6 +907,8 @@ user message.  ORIG-FN and ARGS are the advised call."
           (setq agent-shell-bridge--session-title prompt))
         (agent-shell-bridge--ensure-session agent-shell-bridge--session-title)
         (agent-shell-bridge--set-status t)
+        ;; Push the initial knobs/commands snapshot once the session exists.
+        (agent-shell-bridge--emit-config)
         ;; A prompt injected from the remote is already visible there.
         (unless agent-shell-bridge--from-remote
           (agent-shell-bridge--flush-stream)
@@ -813,7 +991,14 @@ ref-count falls; the daemon self-exits once the last buffer anywhere goes."
     (let* ((provider (agent-shell-bridge-active-provider))
            (close (and provider (agent-shell-bridge-provider-close-session provider))))
       (when close
-        (ignore-errors (funcall close agent-shell-bridge--session-handle)))
+        ;; A throw here must not abort the buffer kill, but silently swallowing
+        ;; it hides a session-close that never reached the daemon (session stays
+        ;; open, never becomes resumable). Log it instead.
+        (condition-case err
+            (funcall close agent-shell-bridge--session-handle)
+          (error (agent-shell-bridge--log
+                  "teardown-session: close failed for %S: %S"
+                  agent-shell-bridge--session-handle err))))
       (remhash agent-shell-bridge--session-handle
                agent-shell-bridge--session->buffer)
       (setq agent-shell-bridge--session-handle nil
